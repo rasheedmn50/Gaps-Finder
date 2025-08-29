@@ -1,21 +1,20 @@
 #!/usr/bin/env python3
 # Streamlit Paper Gap Analyzer — High-Rigor + OCR + Branding + CSV + Appendix + Plain-Language DOCX
 # -------------------------------------------------------------------------------------------------
-# Upload up to 50 PDFs/DOCX/TXT. Analyze shared research gaps. Optional High-Rigor mode:
-#   • Evidence-first extraction (quotes + page markers + section)
-#   • Section-aware prompts
+# Upload up to 50 PDFs/DOCX/TXT. Analyze shared research gaps.
+# Features:
+#   • High-Rigor mode: evidence quotes + page markers + section-aware prompts
 #   • HDBSCAN clustering + re-ranking (coverage × severity × evidence)
-#   • Reviewer approval UI
+#   • Reviewer approval UI (accept/edit gaps before clustering)
 #   • Checklist tags (TRIPOD-AI / CONSORT-AI / STARE-HI inspired)
-#
-# NEW:
-#   • OCR for scanned PDFs (pypdfium2 + pytesseract) — auto or forced
+#   • OCR for scanned PDFs (pypdfium2 + pytesseract) — Auto / Force / Off
 #   • Branding: persistent logo (assets/logo.png) or upload + choose accent color
-#   • Download CSV of accepted gaps with evidence
-#   • DOCX reports include Appendix of representative quotes
-#   • Plain-Language Word report (very simple words, short sentences, no jargon)
+#   • Downloads: CSV (edited + final), DOCX reports, with Appendix of quotes
+#   • Report styles: Narrative, Executive Brief, Plain-Language (very simple words)
+# NEW:
+#   • Robust parsing of severity/confidence (handles "low/medium/high", %, etc.)
 #
-# Local:
+# Local run:
 #   pip install -r requirements.txt
 #   streamlit run app.py
 #
@@ -46,7 +45,7 @@ except Exception:
 
 try:
     import pytesseract
-    from PIL import Image  # noqa: F401  (pytesseract uses PIL images)
+    from PIL import Image  # used by pytesseract
     import pypdfium2 as pdfium
     OCR_AVAILABLE = True
 except Exception:
@@ -181,6 +180,64 @@ with c2:
 if clear_btn:
     st.session_state.clear()
     st.experimental_rerun()
+
+# ------------- Robust numeric parsers (NEW) -------------
+def _to_float(s):
+    try:
+        return float(s)
+    except Exception:
+        return None
+
+def parse_confidence(x) -> float:
+    """
+    Confidence in [0,1]. Accepts numbers, '0.7', '70%', 'low/medium/high', 'very high', etc.
+    """
+    if isinstance(x, (int, float)):
+        val = float(x)
+        if val > 1.0:
+            val = val / 100.0 if val <= 100 else 1.0
+        return max(0.0, min(1.0, val))
+    if isinstance(x, str):
+        s = x.strip().lower()
+        m = re.match(r'^(\d+(?:\.\d+)?)\s*%$', s)
+        if m:
+            return max(0.0, min(1.0, float(m.group(1)) / 100.0))
+        n = _to_float(s)
+        if n is not None:
+            if n > 1.0:
+                n = n / 100.0 if n <= 100 else 1.0
+            return max(0.0, min(1.0, n))
+        mapping = {
+            "very low": 0.15, "low": 0.25,
+            "medium": 0.5, "med": 0.5, "moderate": 0.5,
+            "high": 0.85, "very high": 0.95,
+        }
+        for k, v in mapping.items():
+            if k in s:
+                return v
+    return 0.5
+
+def parse_severity(x) -> int:
+    """
+    Severity as integer 1..5. Accepts numbers, numeric strings, and words (low/medium/high etc).
+    """
+    if isinstance(x, (int, float)):
+        return int(max(1, min(5, round(float(x)))))
+    if isinstance(x, str):
+        s = x.strip().lower()
+        n = _to_float(s)
+        if n is not None:
+            return int(max(1, min(5, round(n))))
+        mapping = {
+            "trivial": 1, "minor": 2, "low": 2,
+            "medium": 3, "med": 3, "moderate": 3,
+            "high": 4, "major": 4,
+            "very high": 5, "critical": 5, "severe": 5,
+        }
+        for k, v in mapping.items():
+            if k in s:
+                return v
+    return 3
 
 # ------------- LLM helpers -------------
 def build_client(key: str) -> OpenAI:
@@ -338,6 +395,7 @@ def normalize_simple(data: Dict[str, Any], paper_id: str) -> Dict[str, Any]:
                     if s:
                         cleaned.append(s)
         out[k] = cleaned
+
     gaps = data.get("inferred_gaps") or []
     if isinstance(gaps, list):
         for g in gaps:
@@ -345,15 +403,13 @@ def normalize_simple(data: Dict[str, Any], paper_id: str) -> Dict[str, Any]:
                 desc = str(g.get("description") or g.get("text") or "").strip()
                 if not desc:
                     continue
-                try:
-                    sev = int(round(float(g.get("severity", 3))))
-                except Exception:
-                    sev = 3
+                sev = parse_severity(g.get("severity", 3))
+                conf = parse_confidence(g.get("confidence", 0.5))
                 out["inferred_gaps"].append({
                     "description": desc,
                     "category": str(g.get("category") or "Other"),
                     "severity": min(max(sev, 1), 5),
-                    "confidence": float(g.get("confidence", 0.5)) if isinstance(g.get("confidence", 0.5), (int, float, str)) else 0.5,
+                    "confidence": conf,
                     "evidence_quote": g.get("evidence_quote") if isinstance(g.get("evidence_quote"), str) else None,
                     "evidence_page": g.get("evidence_page")
                 })
@@ -383,7 +439,7 @@ def normalize_rigorous(data: Dict[str, Any], paper_id: str) -> Dict[str, Any]:
                 "section": str(item.get("section") or ""),
                 "evidence_quote": str(item.get("evidence_quote") or "")[:400],
                 "evidence_page": item.get("evidence_page"),
-                "confidence": float(item.get("confidence", 0.8)) if isinstance(item.get("confidence", 0.8), (int, float, str)) else 0.8
+                "confidence": parse_confidence(item.get("confidence", 0.8))
             })
         elif isinstance(item, (str, int, float)):
             rep.append({
@@ -505,6 +561,8 @@ def analyze_paper_simple(client: OpenAI, model: str, paper_id: str, text: str) -
         "Extract concise structured metadata, reported limitations, and inferred gaps grounded in the paper text."
     )
     user = (
+        "IMPORTANT: `severity` MUST be an integer 1–5 (no words). "
+        "`confidence` MUST be a number 0–1 (no words). If unsure, use 0.5.\n\n"
         f"PAPER_ID: {paper_id}\n\nReturn only JSON matching the schema (no prose).\n\n"
         f"--- PAPER FULL TEXT START ---\n{text}\n--- PAPER FULL TEXT END ---"
     )
@@ -533,6 +591,8 @@ def analyze_paper_rigorous(client: OpenAI, model: str, paper_id: str, sectioned_
         "For inferred gaps, keep confidence low unless supported by a quote."
     )
     user = (
+        "IMPORTANT: `severity` MUST be an integer 1–5 (no words). "
+        "`confidence` MUST be a number 0–1 (no words). If unsure, use 0.5.\n\n"
         "Return ONLY JSON matching the schema. For each REPORTED limitation: include 'description', 'section', "
         "'evidence_quote' (<=60 words), and 'evidence_page' from any [[PAGE N]] markers if possible.\n"
         "For each INFERRED gap: include 'description','category','severity (1-5)','confidence', and optional 'evidence_quote'/'evidence_page'.\n\n"
@@ -600,7 +660,7 @@ def hdbscan_cluster(vectors: np.ndarray) -> List[List[int]]:
 def cluster_stats_from_members(members: List[int], items: List[Dict[str, Any]]) -> Dict[str, Any]:
     subset = [items[i] for i in members]
     uniq_papers = sorted({x["paper_id"] for x in subset})
-    severities = [x.get("severity", 3) for x in subset]
+    severities = [parse_severity(x.get("severity", 3)) for x in subset]
     srcs = [x.get("source", "Reported") for x in subset]
     evidence = [1 if (x.get("evidence_quote")) else 0 for x in subset]
     return {
@@ -876,10 +936,7 @@ if run_btn:
                 desc = (g.get("description") or "").strip()
                 if not desc:
                     continue
-                try:
-                    sev = int(round(float(g.get("severity", 3))))
-                except Exception:
-                    sev = 3
+                sev = parse_severity(g.get("severity", 3))
                 raw_items.append({
                     "paper_id": pid,
                     "text": desc,
@@ -959,7 +1016,7 @@ if run_btn:
             continue
         item = base.copy()
         item["text"] = row["Text"].strip()
-        item["severity"] = int(row["Severity"])
+        item["severity"] = int(row["Severity"])  # editor guarantees number 1..5
         item["section"] = row.get("Section", "")
         item["evidence_quote"] = row.get("EvidenceQuote", "")
         item["evidence_page"] = row.get("EvidencePage", "")
