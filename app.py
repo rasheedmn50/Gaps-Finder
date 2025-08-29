@@ -157,7 +157,7 @@ logo_bytes = get_logo_bytes()
 left, right = st.columns([1, 5])
 with left:
     if logo_bytes:
-        st.image(logo_bytes, use_container_width=True)
+        st.image(logo_bytes, use_container_width="stretch")
 with right:
     st.markdown('<div class="app-title"><h1 style="margin:0;">🧠 Paper Gap Analyzer</h1></div>', unsafe_allow_html=True)
     st.caption("Find shared research gaps across uploaded papers and export a clean, branded report.")
@@ -789,8 +789,8 @@ def txt_from_paragraphs(title: str, paragraphs: List[str], appendix_items: List[
 uploaded = st.file_uploader("Upload your papers (PDF / DOCX / TXT)", type=["pdf","docx","txt"], accept_multiple_files=True)
 
 col_u1, col_u2 = st.columns([1,1])
-start_btn = col_u1.button("Start analysis", type="primary", use_container_width=True)
-reset_btn = col_u2.button("Reset", use_container_width=True)
+start_btn = col_u1.button("Start analysis", type="primary", use_container_width="stretch")
+reset_btn = col_u2.button("Reset", use_container_width="stretch")
 
 if reset_btn:
     for k in list(st.session_state.keys()):
@@ -936,7 +936,7 @@ if st.session_state.stage in ("review","clustered","report"):
 
     st.caption("Uncheck to exclude; edit text/evidence freely before clustering.")
     edited = st.data_editor(
-        df, height=360, use_container_width=True, key="editor",
+        df, height=360, use_container_width="stretch", key="editor",
         column_config={
             "Accept": st.column_config.CheckboxColumn(),
             "Text": st.column_config.TextColumn(width="large"),
@@ -950,11 +950,11 @@ if st.session_state.stage in ("review","clustered","report"):
         data=edited.to_csv(index=False).encode("utf-8"),
         file_name="accepted_gaps_edited.csv",
         mime="text/csv",
-        use_container_width=True
+        use_container_width="stretch"
     )
 
     # Proceed button — sets stage to clustered and persists accepted
-    proceed = st.button("Cluster accepted gaps", type="primary", use_container_width=True)
+    proceed = st.button("Cluster accepted gaps", type="primary", use_container_width="stretch")
     if proceed:
         accepted: List[Dict[str, Any]] = []
         for row, base in zip(edited.to_dict("records"), raw_items):
@@ -1093,15 +1093,15 @@ if st.session_state.stage == "report":
     # Buttons — ALWAYS render (TXT fallback ensures visibility)
     st.download_button(
         f"⬇️ Download {main_base}{ext_main}",
-        data=data_main, file_name=f"{main_base}{ext_main}", mime=mime_main, use_container_width=True
+        data=data_main, file_name=f"{main_base}{ext_main}", mime=mime_main, use_container_width="stretch"
     )
     st.download_button(
         f"⬇️ Also download plain_language_summary{ext_plain}",
-        data=data_plain, file_name=f"plain_language_summary{ext_plain}", mime=mime_plain, use_container_width=True
+        data=data_plain, file_name=f"plain_language_summary{ext_plain}", mime=mime_plain, use_container_width="stretch"
     )
     st.download_button(
         "⬇️ Download TXT (always available)",
-        data=data_txt, file_name=f"{main_base}.txt", mime="text/plain", use_container_width=True
+        data=data_txt, file_name=f"{main_base}.txt", mime="text/plain", use_container_width="stretch"
     )
 
     # CSV of accepted gaps (final snapshot)
@@ -1115,5 +1115,5 @@ if st.session_state.stage == "report":
         "⬇️ Download CSV of accepted gaps (final)",
         data=final_df.to_csv(index=False).encode("utf-8"),
         file_name="accepted_gaps_final.csv",
-        mime="text/csv", use_container_width=True
+        mime="text/csv", use_container_width="stretch"
     )
