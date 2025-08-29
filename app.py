@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-# Streamlit Paper Gap Analyzer — High-Rigor + OCR + Branding + CSV + Appendix
-# ---------------------------------------------------------------------------
+# Streamlit Paper Gap Analyzer — High-Rigor + OCR + Branding + CSV + Appendix + Plain-Language DOCX
+# -------------------------------------------------------------------------------------------------
 # Upload up to 50 PDFs/DOCX/TXT. Analyze shared research gaps. Optional High-Rigor mode:
 #   • Evidence-first extraction (quotes + page markers + section)
 #   • Section-aware prompts
@@ -13,6 +13,7 @@
 #   • Branding: persistent logo (assets/logo.png) or upload + choose accent color
 #   • Download CSV of accepted gaps with evidence
 #   • DOCX reports include Appendix of representative quotes
+#   • Plain-Language Word report (very simple words, short sentences, no jargon)
 #
 # Local:
 #   pip install -r requirements.txt
@@ -45,7 +46,7 @@ except Exception:
 
 try:
     import pytesseract
-    from PIL import Image
+    from PIL import Image  # noqa: F401  (pytesseract uses PIL images)
     import pypdfium2 as pdfium
     OCR_AVAILABLE = True
 except Exception:
@@ -654,7 +655,7 @@ def llm_tag_gaps(client: OpenAI, model: str, gap_texts: List[str]) -> List[List[
     except Exception:
         return [[] for _ in gap_texts]
 
-# ------------- Report generation (narrative / executive) -------------
+# ------------- Report generation (3 styles) -------------
 def llm_narrative(client: OpenAI, model: str, clusters_payload: Dict[str, Any]) -> str:
     system = (
         "You write clear, non-technical academic summaries.\n"
@@ -680,6 +681,29 @@ def llm_executive_brief(client: OpenAI, model: str, clusters_payload: Dict[str, 
         "• Two short paragraphs that plainly describe the main gaps (no lists, no numbers).\n"
         "• One final 2–3 sentence recommendation naming the best gap to pursue and a concrete starting step.\n"
         "No headings, no bullets—just three compact paragraphs.\n\n"
+        "JSON:\n" + json.dumps(clusters_payload, ensure_ascii=False)
+    )
+    content = safe_chat(
+        client, model,
+        [{"role": "system", "content": system}, {"role": "user", "content": user}],
+        use_schema=False
+    )
+    return re.sub(r"`{3,}.*?`{3,}", "", content, flags=re.DOTALL).strip()
+
+def llm_plain_language(client: OpenAI, model: str, clusters_payload: Dict[str, Any]) -> str:
+    """
+    Very simple words, short sentences, no jargon. 3–4 paragraphs describing the main gaps.
+    Final paragraph recommends one gap to work on and says how to start. <= 400 words.
+    """
+    system = (
+        "You explain research in very simple words for busy readers.\n"
+        "Use short sentences. Avoid jargon. No lists. No headings. No numbers or percentages."
+    )
+    user = (
+        "Write 3–4 short paragraphs in very simple words that explain the main gaps shared across these papers. "
+        "Use plain language and short sentences. Avoid any technical terms.\n"
+        "Then add ONE final paragraph that clearly says which single gap is best to work on next and one simple way to start.\n"
+        "Do not use lists, bullets, tables, or headings. Keep it under 400 words total.\n\n"
         "JSON:\n" + json.dumps(clusters_payload, ensure_ascii=False)
     )
     content = safe_chat(
@@ -994,39 +1018,68 @@ if run_btn:
     with st.expander("Preview: top cluster examples"):
         st.write(stats[order[0]]["samples"] if order else [])
 
-    # 4) Report generation
+    # 4) Report generation — choose style and also produce Plain-Language DOCX
     st.subheader("Step 4 — Generate report")
-    brief_mode = st.toggle("Executive Brief (short)", value=False)
+    style = st.radio(
+        "Choose your main report style",
+        ["Narrative", "Executive Brief (short)", "Plain-Language (very simple words)"],
+        horizontal=True
+    )
 
     try:
-        if brief_mode:
-            text = llm_executive_brief(client, model, clusters_payload)
-            title = "Executive Brief — Research Gaps"
+        if style == "Executive Brief (short)":
+            main_text = llm_executive_brief(client, model, clusters_payload)
+            main_title = "Executive Brief — Research Gaps"
+            main_fname = "executive_brief.docx"
+        elif style == "Plain-Language (very simple words)":
+            main_text = llm_plain_language(client, model, clusters_payload)
+            main_title = "Plain-Language Summary — What’s Missing and What To Do"
+            main_fname = "plain_language_summary.docx"
         else:
-            text = llm_narrative(client, model, clusters_payload)
-            title = "Research Gaps — Narrative Summary"
+            main_text = llm_narrative(client, model, clusters_payload)
+            main_title = "Research Gaps — Narrative Summary"
+            main_fname = "final_report_narrative.docx"
     except Exception as e:
         st.error(f"Report generation failed: {e}")
         st.stop()
 
-    st.text_area("Report preview", value=text, height=260)
+    st.text_area("Report preview", value=main_text, height=260)
 
-    # Build DOCX with logo + appendix
-    paragraphs = [p.strip() for p in text.split("\n\n") if p.strip()]
-    docx_bytes = docx_from_paragraphs_with_appendix(
-        title, paragraphs, appendix_items, logo_bytes, accent
+    # Always also prepare a Plain-Language DOCX for download (in addition to chosen style)
+    try:
+        plain_text = llm_plain_language(client, model, clusters_payload)
+    except Exception:
+        plain_text = "This plain-language summary could not be generated."
+
+    # Build DOCX files
+    paragraphs_main = [p.strip() for p in main_text.split("\n\n") if p.strip()]
+    docx_main = docx_from_paragraphs_with_appendix(
+        main_title, paragraphs_main, appendix_items, logo_bytes, accent
     )
 
-    if docx_bytes:
+    paragraphs_plain = [p.strip() for p in plain_text.split("\n\n") if p.strip()]
+    docx_plain = docx_from_paragraphs_with_appendix(
+        "Plain-Language Summary — What’s Missing and What To Do",
+        paragraphs_plain, appendix_items, logo_bytes, accent
+    )
+
+    # Download buttons
+    if docx_main:
         st.download_button(
-            "⬇️ Download DOCX",
-            data=docx_bytes,
-            file_name=("executive_brief.docx" if brief_mode else "final_report_narrative.docx"),
+            f"⬇️ Download {main_fname}",
+            data=docx_main,
+            file_name=main_fname,
             mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
             use_container_width=True
         )
-    else:
-        st.warning("python-docx not installed; cannot build DOCX.")
+    if docx_plain:
+        st.download_button(
+            "⬇️ Also download Plain-Language DOCX",
+            data=docx_plain,
+            file_name="plain_language_summary.docx",
+            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            use_container_width=True
+        )
 
     # CSV of accepted gaps (final snapshot after clustering stage)
     final_df = pd.DataFrame([{
