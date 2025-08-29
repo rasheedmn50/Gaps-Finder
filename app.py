@@ -3,11 +3,8 @@
 # ----------------------------------------------------------------------------------
 # Upload up to 50 PDFs/DOCX/TXT. Analyze shared research gaps, cluster, and export reports.
 # Fixes in this version:
-#   • Replaced all deprecated `use_container_width` with `width="stretch"` / "content"
-#   • Stage-based flow so buttons work reliably (upload → review → clustered → report)
-#   • Stores uploaded file bytes in session (no lost files on rerun)
-#   • Always shows downloads: DOCX if available, else RTF, and always a TXT fallback
-#   • Robust parsing for severity/confidence (“low/medium/high”, %, etc.)
+#   • Replaced deprecated st.experimental_rerun() with a safe wrapper that uses st.rerun()
+#   • Kept all prior fixes: width="stretch" layout, DOCX/RTF/TXT downloads, OCR, reviewer editor, clustering, tagging
 #
 # Run:
 #   pip install -r requirements.txt
@@ -72,6 +69,16 @@ DEFAULT_MODEL = "gpt-5"
 DEFAULT_EMBEDDING = "text-embedding-3-large"
 MAX_PAPERS = 50
 MAX_CHARS_PER_PAPER = 80_000
+
+# ---- Safe rerun helper (Streamlit ≥1.30 uses st.rerun) ----
+def _safe_rerun():
+    try:
+        st.rerun()
+    except Exception:
+        try:
+            st.experimental_rerun()  # legacy fallback
+        except Exception:
+            pass  # last resort: do nothing
 
 if "stage" not in st.session_state:
     st.session_state.stage = "upload"  # upload → review → clustered → report
@@ -796,7 +803,7 @@ reset_btn = col_u2.button("Reset", width="stretch")
 if reset_btn:
     for k in list(st.session_state.keys()):
         del st.session_state[k]
-    st.experimental_rerun()
+    _safe_rerun()
 
 # Capture uploaded files into session (bytes), so they survive reruns.
 if uploaded:
@@ -860,7 +867,7 @@ if start_btn:
 
     st.session_state.per_paper = per_paper
     st.session_state.stage = "review"
-    st.experimental_rerun()
+    _safe_rerun()
 
 # ----------------------------------------------------------------------------------
 # REVIEW STAGE (accept/edit gaps)
@@ -974,7 +981,7 @@ if st.session_state.stage in ("review","clustered","report"):
             st.stop()
         st.session_state.accepted = accepted
         st.session_state.stage = "clustered"
-        st.experimental_rerun()
+        _safe_rerun()
 
 # ----------------------------------------------------------------------------------
 # CLUSTERED STAGE
