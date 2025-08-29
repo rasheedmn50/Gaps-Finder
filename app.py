@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-# Streamlit Paper Gap Analyzer — High-Rigor + OCR + Branding + CSV + Appendix + Plain-Language DOCX
-# -------------------------------------------------------------------------------------------------
+# Streamlit Paper Gap Analyzer — High-Rigor + OCR + Branding + CSV + Appendix + Plain-Language DOCX/RTF
+# ------------------------------------------------------------------------------------------------------
 # Upload up to 50 PDFs/DOCX/TXT. Analyze shared research gaps.
 # Features:
 #   • High-Rigor mode: evidence quotes + page markers + section-aware prompts
@@ -9,10 +9,11 @@
 #   • Checklist tags (TRIPOD-AI / CONSORT-AI / STARE-HI inspired)
 #   • OCR for scanned PDFs (pypdfium2 + pytesseract) — Auto / Force / Off
 #   • Branding: persistent logo (assets/logo.png) or upload + choose accent color
-#   • Downloads: CSV (edited + final), DOCX reports, with Appendix of quotes
+#   • Downloads: CSV (edited + final), DOCX reports (if python-docx installed), with Appendix of quotes
 #   • Report styles: Narrative, Executive Brief, Plain-Language (very simple words)
 # NEW:
 #   • Robust parsing of severity/confidence (handles "low/medium/high", %, etc.)
+#   • If python-docx is missing, automatic RTF fallback so Word downloads ALWAYS appear
 #
 # Local run:
 #   pip install -r requirements.txt
@@ -113,6 +114,12 @@ ocr_mode = st.sidebar.selectbox(
 )
 st.sidebar.caption("If OCR is Off or unavailable, PDFs are parsed with pypdf text only.")
 
+# DOCX availability badge
+st.sidebar.markdown(
+    ("✅ **DOCX generation:** ready (python-docx installed)" if Document is not None
+     else "⚠️ **DOCX generation unavailable** — install `python-docx`. Using RTF fallback.")
+)
+
 # ------------- Branding helpers -------------
 DEFAULT_LOGO_PATH = "assets/logo.png"
 
@@ -171,7 +178,7 @@ if uploads and len(uploads) > MAX_PAPERS:
     st.warning(f"Only the first {MAX_PAPERS} files will be analyzed.")
     uploads = uploads[:MAX_PAPERS]
 
-c1, c2, c3 = st.columns([1, 1, 2])
+c1, c2, _ = st.columns([1, 1, 2])
 with c1:
     run_btn = st.button("Analyze", type="primary", use_container_width=True)
 with c2:
@@ -181,7 +188,7 @@ if clear_btn:
     st.session_state.clear()
     st.experimental_rerun()
 
-# ------------- Robust numeric parsers (NEW) -------------
+# ------------- Robust numeric parsers -------------
 def _to_float(s):
     try:
         return float(s)
@@ -189,9 +196,7 @@ def _to_float(s):
         return None
 
 def parse_confidence(x) -> float:
-    """
-    Confidence in [0,1]. Accepts numbers, '0.7', '70%', 'low/medium/high', 'very high', etc.
-    """
+    """Confidence in [0,1]. Accepts numbers, '0.7', '70%', 'low/medium/high', 'very high', etc."""
     if isinstance(x, (int, float)):
         val = float(x)
         if val > 1.0:
@@ -218,9 +223,7 @@ def parse_confidence(x) -> float:
     return 0.5
 
 def parse_severity(x) -> int:
-    """
-    Severity as integer 1..5. Accepts numbers, numeric strings, and words (low/medium/high etc).
-    """
+    """Severity as integer 1..5. Accepts numbers, numeric strings, and words (low/medium/high etc)."""
     if isinstance(x, (int, float)):
         return int(max(1, min(5, round(float(x)))))
     if isinstance(x, str):
@@ -773,7 +776,7 @@ def llm_plain_language(client: OpenAI, model: str, clusters_payload: Dict[str, A
     )
     return re.sub(r"`{3,}.*?`{3,}", "", content, flags=re.DOTALL).strip()
 
-# ------------- DOCX (with logo + appendix) -------------
+# ------------- DOCX + RTF builders -------------
 def docx_from_paragraphs_with_appendix(
     title: str,
     paragraphs: List[str],
@@ -840,6 +843,44 @@ def docx_from_paragraphs_with_appendix(
     doc.save(bio)
     return bio.getvalue()
 
+
+def rtf_from_paragraphs_with_appendix(
+    title: str,
+    paragraphs: List[str],
+    appendix_items: List[Dict[str, Any]]
+) -> bytes:
+    """Minimal RTF fallback (opens in Word). No logo embedding (RTF image embedding omitted)."""
+    def esc(s: str) -> str:
+        return s.replace('\\', r'\\').replace('{', r'\{').replace('}', r'\}')
+
+    parts = [r"{\\rtf1\\ansi\\deff0", r"\\fs28 ", r"\\b " + esc(title) + r"\\b0\\par"]
+    parts.append(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}\\par ")
+    parts.append("\\par ")
+    for p in [p.strip() for p in paragraphs if p.strip()]:
+        parts.append(esc(p) + r"\\par ")
+    if appendix_items:
+        parts.append("\\par ")
+        parts.append(r"\\b Appendix — Representative Quotes\\b0\\par ")
+        for it in appendix_items[:40]:
+            line = f"{it.get('paper_id', 'unknown')} — "
+            if it.get('evidence_page'):
+                line += f"[p. {it.get('evidence_page')}] "
+            line += f"\u8220 ?{(it.get('evidence_quote') or '').strip()}\u8221 ?"  # “ ”
+            parts.append(esc(line) + r"\\par ")
+    parts.append("}")
+    return ("".join(parts)).encode("utf-8")
+
+
+def build_word_like_bytes(title: str, paragraphs: List[str], appendix_items: List[Dict[str, Any]],
+                          logo_bytes: Optional[bytes], accent_hex: str) -> Tuple[bytes, str, str]:
+    """Return (data, filename_extension, mime). Uses DOCX if available, otherwise RTF fallback."""
+    if Document is not None:
+        data = docx_from_paragraphs_with_appendix(title, paragraphs, appendix_items, logo_bytes, accent_hex)
+        return data, ".docx", "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+    else:
+        data = rtf_from_paragraphs_with_appendix(title, paragraphs, appendix_items)
+        return data, ".rtf", "application/rtf"
+
 # =====================================================================================
 # MAIN
 # =====================================================================================
@@ -862,7 +903,7 @@ if run_btn:
     for i, up in enumerate(uploads, 1):
         status.info(f"Reading: {up.name}")
         try:
-            full_text, pages = extract_text_with_pages(up, ocr_mode)
+            full_text, _pages = extract_text_with_pages(up, ocr_mode)
         except Exception as e:
             st.warning(f"Skipping {up.name}: read error — {e}")
             progress.progress(i / len(uploads))
@@ -1075,7 +1116,7 @@ if run_btn:
     with st.expander("Preview: top cluster examples"):
         st.write(stats[order[0]]["samples"] if order else [])
 
-    # 4) Report generation — choose style and also produce Plain-Language DOCX
+    # 4) Report generation — choose style and also produce Plain-Language file
     st.subheader("Step 4 — Generate report")
     style = st.radio(
         "Choose your main report style",
@@ -1087,56 +1128,56 @@ if run_btn:
         if style == "Executive Brief (short)":
             main_text = llm_executive_brief(client, model, clusters_payload)
             main_title = "Executive Brief — Research Gaps"
-            main_fname = "executive_brief.docx"
+            main_base = "executive_brief"
         elif style == "Plain-Language (very simple words)":
             main_text = llm_plain_language(client, model, clusters_payload)
             main_title = "Plain-Language Summary — What’s Missing and What To Do"
-            main_fname = "plain_language_summary.docx"
+            main_base = "plain_language_summary"
         else:
             main_text = llm_narrative(client, model, clusters_payload)
             main_title = "Research Gaps — Narrative Summary"
-            main_fname = "final_report_narrative.docx"
+            main_base = "final_report_narrative"
     except Exception as e:
         st.error(f"Report generation failed: {e}")
         st.stop()
 
     st.text_area("Report preview", value=main_text, height=260)
 
-    # Always also prepare a Plain-Language DOCX for download (in addition to chosen style)
+    # Always also prepare a Plain-Language version for download
     try:
         plain_text = llm_plain_language(client, model, clusters_payload)
     except Exception:
         plain_text = "This plain-language summary could not be generated."
 
-    # Build DOCX files
+    # Build Word-like files (DOCX if available, else RTF) — MAIN
     paragraphs_main = [p.strip() for p in main_text.split("\n\n") if p.strip()]
-    docx_main = docx_from_paragraphs_with_appendix(
+    data_main, ext_main, mime_main = build_word_like_bytes(
         main_title, paragraphs_main, appendix_items, logo_bytes, accent
     )
 
+    # Build Word-like files (DOCX if available, else RTF) — PLAIN LANGUAGE
     paragraphs_plain = [p.strip() for p in plain_text.split("\n\n") if p.strip()]
-    docx_plain = docx_from_paragraphs_with_appendix(
+    data_plain, ext_plain, mime_plain = build_word_like_bytes(
         "Plain-Language Summary — What’s Missing and What To Do",
         paragraphs_plain, appendix_items, logo_bytes, accent
     )
 
-    # Download buttons
-    if docx_main:
-        st.download_button(
-            f"⬇️ Download {main_fname}",
-            data=docx_main,
-            file_name=main_fname,
-            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-            use_container_width=True
-        )
-    if docx_plain:
-        st.download_button(
-            "⬇️ Also download Plain-Language DOCX",
-            data=docx_plain,
-            file_name="plain_language_summary.docx",
-            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-            use_container_width=True
-        )
+    # Download buttons — ALWAYS visible (fallback to RTF if DOCX unavailable)
+    st.download_button(
+        f"⬇️ Download {main_base}{ext_main}",
+        data=data_main,
+        file_name=f"{main_base}{ext_main}",
+        mime=mime_main,
+        use_container_width=True
+    )
+
+    st.download_button(
+        f"⬇️ Also download plain_language_summary{ext_plain}",
+        data=data_plain,
+        file_name=f"plain_language_summary{ext_plain}",
+        mime=mime_plain,
+        use_container_width=True
+    )
 
     # CSV of accepted gaps (final snapshot after clustering stage)
     final_df = pd.DataFrame([{
