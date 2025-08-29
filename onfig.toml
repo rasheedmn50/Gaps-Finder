@@ -1,0 +1,14 @@
+# .streamlit/config.toml
+
+[server]
+# Fixes: OSError: inotify watch limit reached
+fileWatcherType = "none"         # or "poll" if you still want auto-reload (slower)
+headless = true                  # typical for servers
+maxUploadSize = 2048             # MB, adjust as you like
+
+[theme]
+primaryColor = "#3B82F6"         # matches the app's accent
+base = "light"
+
+[client]
+toolbarMode = "minimal"
