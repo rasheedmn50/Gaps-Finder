@@ -10,7 +10,7 @@
 #
 # NEW:
 #   • OCR for scanned PDFs (pypdfium2 + pytesseract) — auto or forced
-#   • Branding: upload logo + choose accent color
+#   • Branding: persistent logo (assets/logo.png) or upload + choose accent color
 #   • Download CSV of accepted gaps with evidence
 #   • DOCX reports include Appendix of representative quotes
 #
@@ -29,7 +29,6 @@ import re
 import time
 import warnings
 from typing import Any, Dict, List, Optional, Tuple
-from dataclasses import dataclass
 from datetime import datetime
 
 import numpy as np
@@ -91,13 +90,16 @@ embedding_model = st.sidebar.text_input("Embedding Model", value=DEFAULT_EMBEDDI
 limit_chars = st.sidebar.number_input("Max chars per paper", 20000, 180000, MAX_CHARS_PER_PAPER, 2000)
 
 st.sidebar.markdown("---")
-rigor = st.sidebar.toggle("High-Rigor mode", value=True,
-                          help="Evidence quotes + pages, section-aware prompts, HDBSCAN, reviewer approval, checklist tags.")
+rigor = st.sidebar.toggle(
+    "High-Rigor mode",
+    value=True,
+    help="Evidence quotes + pages, section-aware prompts, HDBSCAN, reviewer approval, checklist tags."
+)
 sim_threshold = st.sidebar.slider("Similarity threshold (fallback clustering)", 0.70, 0.90, 0.82, 0.01)
 
 st.sidebar.markdown("---")
 st.sidebar.subheader("🖼 Branding")
-logo_file = st.sidebar.file_uploader("Logo (PNG/JPG)", type=["png","jpg","jpeg"])
+logo_upload = st.sidebar.file_uploader("Logo (PNG/JPG)", type=["png", "jpg", "jpeg"])
 accent = st.sidebar.text_input("Accent hex color", value="#3B82F6")  # Tailwind blue-500
 st.sidebar.caption("Header uses the accent color. Leave default if unsure.")
 
@@ -109,9 +111,24 @@ ocr_mode = st.sidebar.selectbox(
     index=0 if OCR_AVAILABLE else 2,
     help="OCR needs pytesseract + pypdfium2. Auto only OCRs pages with little/no text."
 )
-st.sidebar.caption("If OCR is Off or unavailable, PDFs are parsed with pypdf only.")
+st.sidebar.caption("If OCR is Off or unavailable, PDFs are parsed with pypdf text only.")
 
-# ------------- Header w/ branding -------------
+# ------------- Branding helpers -------------
+DEFAULT_LOGO_PATH = "assets/logo.png"
+
+def get_logo_bytes() -> Optional[bytes]:
+    """Prefer uploaded logo; fallback to repo assets/logo.png; else None."""
+    if logo_upload is not None:
+        try:
+            return logo_upload.getvalue()
+        except Exception:
+            pass
+    try:
+        with open(DEFAULT_LOGO_PATH, "rb") as f:
+            return f.read()
+    except Exception:
+        return None
+
 def inject_brand_css(accent_hex: str):
     st.markdown(
         f"""
@@ -133,22 +150,28 @@ def inject_brand_css(accent_hex: str):
     )
 
 inject_brand_css(accent)
+logo_bytes = get_logo_bytes()
 
-c_logo, c_title = st.columns([1, 5], vertical_alignment="center")
+# ------------- Header -------------
+c_logo, c_title = st.columns([1, 5])
 with c_logo:
-    if logo_file:
-        st.image(logo_file, use_container_width=True)
+    if logo_bytes:
+        st.image(logo_bytes, use_container_width=True)
 with c_title:
     st.markdown('<div class="app-title"><h1 style="margin:0;">🧠 Paper Gap Analyzer</h1></div>', unsafe_allow_html=True)
     st.caption("Find shared research gaps across uploaded papers and export a clean, branded report.")
 
 # ------------- Uploader & controls -------------
-uploads = st.file_uploader("Upload your papers (PDF / DOCX / TXT)", type=["pdf", "docx", "txt"], accept_multiple_files=True)
+uploads = st.file_uploader(
+    "Upload your papers (PDF / DOCX / TXT)",
+    type=["pdf", "docx", "txt"],
+    accept_multiple_files=True
+)
 if uploads and len(uploads) > MAX_PAPERS:
     st.warning(f"Only the first {MAX_PAPERS} files will be analyzed.")
     uploads = uploads[:MAX_PAPERS]
 
-c1, c2, c3 = st.columns([1,1,2])
+c1, c2, c3 = st.columns([1, 1, 2])
 with c1:
     run_btn = st.button("Analyze", type="primary", use_container_width=True)
 with c2:
@@ -169,7 +192,8 @@ def cleanup_json_str(s: str) -> str:
     s = re.sub(r"^```(json)?\s*|```$", "", s, flags=re.IGNORECASE | re.DOTALL).strip()
     s = re.sub(r"[\x00-\x08\x0B\x0C\x0E-\x1F]", " ", s)
     m = re.search(r"\{[\s\S]*\}", s)
-    if m: s = m.group(0)
+    if m:
+        s = m.group(0)
     s = re.sub(r",\s*(\])", r"\1", s)
     s = re.sub(r",\s*(\})", r"\1", s)
     return s
@@ -208,56 +232,87 @@ def safe_chat(client: OpenAI, model: str, messages: List[Dict[str, str]], *,
 # ------------- Schemas & normalization -------------
 def paper_schema_simple(name="paper_gap") -> Dict[str, Any]:
     return {
-        "name": name, "strict": True,
-        "schema": {"type":"object","additionalProperties":True,"properties":{
-            "paper_id":{"type":"string"},
-            "title":{"type":"string"},
-            "domain":{"type":"string"},
-            "topic_keywords":{"type":"array","items":{"type":"string"}},
-            "methodology":{"type":"string"},
-            "reported_limitations":{"type":"array","items":{"type":["string","object"]}},
-            "reported_future_work":{"type":"array","items":{"type":["string","object"]}},
-            "inferred_gaps":{"type":"array","items":{"type":["string","object"]}}
-        },"required":["paper_id","title","domain","topic_keywords","methodology",
-                      "reported_limitations","reported_future_work","inferred_gaps"]}
+        "name": name,
+        "strict": True,
+        "schema": {
+            "type": "object",
+            "additionalProperties": True,
+            "properties": {
+                "paper_id": {"type": "string"},
+                "title": {"type": "string"},
+                "domain": {"type": "string"},
+                "topic_keywords": {"type": "array", "items": {"type": "string"}},
+                "methodology": {"type": "string"},
+                "reported_limitations": {"type": "array", "items": {"type": ["string", "object"]}},
+                "reported_future_work": {"type": "array", "items": {"type": ["string", "object"]}},
+                "inferred_gaps": {"type": "array", "items": {"type": ["string", "object"]}}
+            },
+            "required": [
+                "paper_id", "title", "domain", "topic_keywords", "methodology",
+                "reported_limitations", "reported_future_work", "inferred_gaps"
+            ]
+        }
     }
 
 def paper_schema_rigorous(name="paper_gap_v2") -> Dict[str, Any]:
     return {
-        "name": name, "strict": True,
-        "schema": {"type":"object","additionalProperties":True,"properties":{
-            "paper_id":{"type":"string"},
-            "title":{"type":"string"},
-            "domain":{"type":"string"},
-            "topic_keywords":{"type":"array","items":{"type":"string"}},
-            "methodology":{"type":"string"},
-            "reported_limitations":{
-                "type":"array","items":{"type":"object","additionalProperties":True,"properties":{
-                    "description":{"type":"string"},
-                    "section":{"type":"string"},
-                    "evidence_quote":{"type":"string"},
-                    "evidence_page":{"type":["integer","array","string","null"]},
-                    "confidence":{"type":["number","integer"]},
-                },"required":["description","section","evidence_quote"]}}
+        "name": name,
+        "strict": True,
+        "schema": {
+            "type": "object",
+            "additionalProperties": True,
+            "properties": {
+                "paper_id": {"type": "string"},
+                "title": {"type": "string"},
+                "domain": {"type": "string"},
+                "topic_keywords": {"type": "array", "items": {"type": "string"}},
+                "methodology": {"type": "string"},
+                "reported_limitations": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": True,
+                        "properties": {
+                            "description": {"type": "string"},
+                            "section": {"type": "string"},
+                            "evidence_quote": {"type": "string"},
+                            "evidence_page": {"type": ["integer", "array", "string", "null"]},
+                            "confidence": {"type": ["number", "integer"]}
+                        },
+                        "required": ["description", "section", "evidence_quote"]
+                    }
+                },
+                "reported_future_work": {"type": "array", "items": {"type": ["string", "object"]}},
+                "inferred_gaps": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": True,
+                        "properties": {
+                            "description": {"type": "string"},
+                            "category": {"type": "string"},
+                            "severity": {"type": ["integer", "number"]},
+                            "confidence": {"type": ["number", "integer"]},
+                            "evidence_quote": {"type": ["string", "null"]},
+                            "evidence_page": {"type": ["integer", "array", "string", "null"]}
+                        },
+                        "required": ["description", "category", "severity", "confidence"]
+                    }
+                }
             },
-            "reported_future_work":{"type":"array","items":{"type":["string","object"]}},
-            "inferred_gaps":{"type":"array","items":{"type":"object","additionalProperties":True,"properties":{
-                "description":{"type":"string"},
-                "category":{"type":"string"},
-                "severity":{"type":["integer","number"]},
-                "confidence":{"type":["number","integer"]},
-                "evidence_quote":{"type":["string","null"]},
-                "evidence_page":{"type":["integer","array","string","null"]},
-            },"required":["description","category","severity","confidence"]}}
-        },"required":["paper_id","title","domain","topic_keywords","methodology",
-                      "reported_limitations","reported_future_work","inferred_gaps"]}
+            "required": [
+                "paper_id", "title", "domain", "topic_keywords", "methodology",
+                "reported_limitations", "reported_future_work", "inferred_gaps"
+            ]
+        }
     }
 
 def norm_list_str(x):
-    if not isinstance(x, list): return []
-    return [str(t) for t in x if isinstance(t,(str,int,float))]
+    if not isinstance(x, list):
+        return []
+    return [str(t) for t in x if isinstance(t, (str, int, float))]
 
-def normalize_simple(data: Dict[str,Any], paper_id: str) -> Dict[str,Any]:
+def normalize_simple(data: Dict[str, Any], paper_id: str) -> Dict[str, Any]:
     out = {
         "paper_id": str(data.get("paper_id", paper_id)),
         "title": str(data.get("title", paper_id)),
@@ -268,58 +323,74 @@ def normalize_simple(data: Dict[str,Any], paper_id: str) -> Dict[str,Any]:
         "reported_future_work": [],
         "inferred_gaps": []
     }
-    for k in ("reported_limitations","reported_future_work"):
+    for k in ("reported_limitations", "reported_future_work"):
         v = data.get(k) or []
-        cleaned=[]
+        cleaned = []
         if isinstance(v, list):
             for item in v:
                 if isinstance(item, str):
-                    s=item.strip()
-                    if s: cleaned.append(s)
+                    s = item.strip()
+                    if s:
+                        cleaned.append(s)
                 elif isinstance(item, dict):
-                    s=str(item.get("text") or item.get("description") or "").strip()
-                    if s: cleaned.append(s)
-        out[k]=cleaned
+                    s = str(item.get("text") or item.get("description") or "").strip()
+                    if s:
+                        cleaned.append(s)
+        out[k] = cleaned
     gaps = data.get("inferred_gaps") or []
     if isinstance(gaps, list):
         for g in gaps:
             if isinstance(g, dict):
                 desc = str(g.get("description") or g.get("text") or "").strip()
-                if not desc: continue
-                try: sev=int(round(float(g.get("severity",3))))
-                except: sev=3
+                if not desc:
+                    continue
+                try:
+                    sev = int(round(float(g.get("severity", 3))))
+                except Exception:
+                    sev = 3
                 out["inferred_gaps"].append({
-                    "description": desc, "category": str(g.get("category") or "Other"),
-                    "severity": min(max(sev,1),5),
-                    "confidence": float(g.get("confidence",0.5)) if isinstance(g.get("confidence",0.5),(int,float,str)) else 0.5,
-                    "evidence_quote": g.get("evidence_quote") if isinstance(g.get("evidence_quote"),str) else None,
-                    "evidence_page": g.get("evidence_page"),
+                    "description": desc,
+                    "category": str(g.get("category") or "Other"),
+                    "severity": min(max(sev, 1), 5),
+                    "confidence": float(g.get("confidence", 0.5)) if isinstance(g.get("confidence", 0.5), (int, float, str)) else 0.5,
+                    "evidence_quote": g.get("evidence_quote") if isinstance(g.get("evidence_quote"), str) else None,
+                    "evidence_page": g.get("evidence_page")
                 })
-            elif isinstance(g,(str,int,float)):
-                s=str(g).strip()
-                if s: out["inferred_gaps"].append({
-                    "description": s, "category":"Other", "severity":3, "confidence":0.5,
-                    "evidence_quote": None, "evidence_page": None
-                })
+            elif isinstance(g, (str, int, float)):
+                s = str(g).strip()
+                if s:
+                    out["inferred_gaps"].append({
+                        "description": s,
+                        "category": "Other",
+                        "severity": 3,
+                        "confidence": 0.5,
+                        "evidence_quote": None,
+                        "evidence_page": None
+                    })
     return out
 
-def normalize_rigorous(data: Dict[str,Any], paper_id: str) -> Dict[str,Any]:
+def normalize_rigorous(data: Dict[str, Any], paper_id: str) -> Dict[str, Any]:
     out = normalize_simple(data, paper_id)
-    rep=[]
+    rep = []
     for item in data.get("reported_limitations") or []:
         if isinstance(item, dict):
             desc = str(item.get("description") or item.get("text") or "").strip()
-            if not desc: continue
+            if not desc:
+                continue
             rep.append({
                 "description": desc,
                 "section": str(item.get("section") or ""),
                 "evidence_quote": str(item.get("evidence_quote") or "")[:400],
                 "evidence_page": item.get("evidence_page"),
-                "confidence": float(item.get("confidence", 0.8)) if isinstance(item.get("confidence",0.8),(int,float,str)) else 0.8
+                "confidence": float(item.get("confidence", 0.8)) if isinstance(item.get("confidence", 0.8), (int, float, str)) else 0.8
             })
-        elif isinstance(item,(str,int,float)):
+        elif isinstance(item, (str, int, float)):
             rep.append({
-                "description": str(item).strip(), "section":"", "evidence_quote":"", "evidence_page": None, "confidence":0.6
+                "description": str(item).strip(),
+                "section": "",
+                "evidence_quote": "",
+                "evidence_page": None,
+                "confidence": 0.6
             })
     out["reported_limitations"] = rep
     return out
@@ -333,7 +404,7 @@ def pdf_text_pages_pypdf(data: bytes) -> List[str]:
             reader = PdfReader(io.BytesIO(data), strict=False)
         except TypeError:
             reader = PdfReader(io.BytesIO(data))
-        pages=[]
+        pages = []
         for page in reader.pages:
             try:
                 pages.append(page.extract_text() or "")
@@ -349,10 +420,10 @@ def ocr_pages_pdfium(data: bytes, dpi: int = 220, lang: str = "eng") -> List[str
     try:
         pdf = pdfium.PdfDocument(io.BytesIO(data))
         n = len(pdf)
-        results=[]
+        results = []
         for i in range(n):
             page = pdf[i]
-            bitmap = page.render(scale=dpi/72.0)  # 72 dpi base
+            bitmap = page.render(scale=dpi / 72.0)
             pil_image = bitmap.to_pil()
             txt = pytesseract.image_to_string(pil_image, lang=lang)
             results.append(txt or "")
@@ -381,17 +452,15 @@ def extract_text_with_pages(upload, ocr_mode: str) -> Tuple[str, List[str]]:
         t = read_docx_stream(data)
         return t, [t]
     if name.endswith(".pdf"):
-        # step 1: pypdf
         pypdf_pages = pdf_text_pages_pypdf(data)
         if ocr_mode == "Off" or not OCR_AVAILABLE:
             pages = pypdf_pages
         elif ocr_mode == "Force OCR (all PDF pages)":
             pages = ocr_pages_pdfium(data)
-            # if OCR failed entirely, fall back to pypdf
-            if not pages or all(len(x.strip()) == 0 for x in pages):
+            if not pages or all(len((x or "").strip()) == 0 for x in pages):
                 pages = pypdf_pages
         else:
-            # Auto: OCR only pages with low text
+            # Auto OCR only pages with low text
             pages = pypdf_pages[:]
             to_ocr = [i for i, t in enumerate(pages) if len((t or "").strip()) < 40]
             if to_ocr:
@@ -412,38 +481,48 @@ SECTION_HEADERS = [
     r"\bmaterials and methods\b", r"\bresults\b", r"\bdiscussion\b",
     r"\blimitations?\b", r"\bconclusion(s)?\b"
 ]
+
 def split_into_sections(text: str) -> Dict[str, str]:
-    idxs=[]
+    idxs = []
     for m in re.finditer("|".join(SECTION_HEADERS), text, flags=re.IGNORECASE):
         idxs.append((m.start(), m.group(0).lower()))
     if not idxs:
         return {"FullText": text}
     idxs.sort()
-    sections={}
+    sections: Dict[str, str] = {}
     for i, (pos, hdr) in enumerate(idxs):
-        end = idxs[i+1][0] if i+1 < len(idxs) else len(text)
+        end = idxs[i + 1][0] if i + 1 < len(idxs) else len(text)
         sections[hdr.strip().title()] = text[pos:end].strip()
     return sections
 
 # ------------- LLM Analysis -------------
-def analyze_paper_simple(client: OpenAI, model: str, paper_id: str, text: str) -> Dict[str,Any]:
-    if len(text) > MAX_CHARS_PER_PAPER: text = text[:MAX_CHARS_PER_PAPER]
-    system = ("You are a meticulous research-methods auditor.\n"
-              "Extract concise structured metadata, reported limitations, and inferred gaps grounded in the paper text.")
-    user = (f"PAPER_ID: {paper_id}\n\nReturn only JSON matching the schema (no prose).\n\n"
-            f"--- PAPER FULL TEXT START ---\n{text}\n--- PAPER FULL TEXT END ---")
-    content = safe_chat(client, model,
-                        [{"role":"system","content":system},{"role":"user","content":user}],
-                        use_schema=True, schema=paper_schema_simple())
+def analyze_paper_simple(client: OpenAI, model: str, paper_id: str, text: str) -> Dict[str, Any]:
+    if len(text) > MAX_CHARS_PER_PAPER:
+        text = text[:MAX_CHARS_PER_PAPER]
+    system = (
+        "You are a meticulous research-methods auditor.\n"
+        "Extract concise structured metadata, reported limitations, and inferred gaps grounded in the paper text."
+    )
+    user = (
+        f"PAPER_ID: {paper_id}\n\nReturn only JSON matching the schema (no prose).\n\n"
+        f"--- PAPER FULL TEXT START ---\n{text}\n--- PAPER FULL TEXT END ---"
+    )
+    content = safe_chat(
+        client, model,
+        [{"role": "system", "content": system}, {"role": "user", "content": user}],
+        use_schema=True, schema=paper_schema_simple()
+    )
     return normalize_simple(parse_possible_json(content), paper_id)
 
-def analyze_paper_rigorous(client: OpenAI, model: str, paper_id: str, sectioned_text: Dict[str,str]) -> Dict[str,Any]:
-    parts=[]
-    for k,v in sectioned_text.items():
-        if not v or not v.strip(): continue
+def analyze_paper_rigorous(client: OpenAI, model: str, paper_id: str, sectioned_text: Dict[str, str]) -> Dict[str, Any]:
+    parts = []
+    for k, v in sectioned_text.items():
+        if not v or not v.strip():
+            continue
         vv = v.strip()
-        if len(vv) > int(MAX_CHARS_PER_PAPER/len(sectioned_text)):
-            vv = vv[: int(MAX_CHARS_PER_PAPER/len(sectioned_text))]
+        budget = max(2000, int(MAX_CHARS_PER_PAPER / max(1, len(sectioned_text))))
+        if len(vv) > budget:
+            vv = vv[:budget]
         parts.append(f"=== {k} ===\n{vv}\n")
     joined = "\n".join(parts)
 
@@ -458,37 +537,48 @@ def analyze_paper_rigorous(client: OpenAI, model: str, paper_id: str, sectioned_
         "For each INFERRED gap: include 'description','category','severity (1-5)','confidence', and optional 'evidence_quote'/'evidence_page'.\n\n"
         + joined
     )
-    content = safe_chat(client, model,
-                        [{"role":"system","content":system},{"role":"user","content":user}],
-                        use_schema=True, schema=paper_schema_rigorous())
+    content = safe_chat(
+        client, model,
+        [{"role": "system", "content": system}, {"role": "user", "content": user}],
+        use_schema=True, schema=paper_schema_rigorous()
+    )
     return normalize_rigorous(parse_possible_json(content), paper_id)
 
 # ------------- Embeddings & clustering -------------
 def embed(client: OpenAI, embedding_model: str, texts: List[str]) -> np.ndarray:
-    out=[]; 
-    if not texts: return np.zeros((0, 1536), dtype=np.float32)
-    B=64
-    for i in range(0,len(texts),B):
-        batch=texts[i:i+B]
-        emb=client.embeddings.create(model=embedding_model, input=batch)
-        vecs=[d.embedding for d in emb.data]
+    out = []
+    if not texts:
+        return np.zeros((0, 1536), dtype=np.float32)
+    B = 64
+    for i in range(0, len(texts), B):
+        batch = texts[i:i + B]
+        emb = client.embeddings.create(model=embedding_model, input=batch)
+        vecs = [d.embedding for d in emb.data]
         out.append(np.array(vecs, dtype=np.float32))
     return np.vstack(out)
 
 def greedy_cluster(vectors: np.ndarray, threshold: float) -> List[List[int]]:
-    n=len(vectors); unused=set(range(n)); clusters=[]
+    n = len(vectors)
+    unused = set(range(n))
+    clusters: List[List[int]] = []
     while unused:
-        seed=unused.pop(); members=[seed]
-        centroid=vectors[seed].copy()
-        changed=True
+        seed = unused.pop()
+        members = [seed]
+        centroid = vectors[seed].copy()
+        changed = True
         while changed:
-            changed=False; to_add=[]
+            changed = False
+            to_add = []
             for j in list(unused):
-                sim=float(np.dot(centroid, vectors[j])/(np.linalg.norm(centroid)*np.linalg.norm(vectors[j])+1e-9))
-                if sim>=threshold: to_add.append(j)
+                sim = float(np.dot(centroid, vectors[j]) / (np.linalg.norm(centroid) * np.linalg.norm(vectors[j]) + 1e-9))
+                if sim >= threshold:
+                    to_add.append(j)
             if to_add:
-                for j in to_add: unused.remove(j); members.append(j)
-                centroid=vectors[members].mean(axis=0); changed=True
+                for j in to_add:
+                    unused.remove(j)
+                    members.append(j)
+                centroid = vectors[members].mean(axis=0)
+                changed = True
         clusters.append(members)
     return clusters
 
@@ -498,43 +588,43 @@ def hdbscan_cluster(vectors: np.ndarray) -> List[List[int]]:
     X = sk_normalize(vectors)
     clusterer = hdbscan.HDBSCAN(min_cluster_size=3, min_samples=1, metric='euclidean')
     labels = clusterer.fit_predict(X)
-    clusters: Dict[int,List[int]] = {}
+    clusters_map: Dict[int, List[int]] = {}
     for idx, lab in enumerate(labels):
         if lab == -1:
-            clusters[f"noise-{idx}"] = [idx]
+            clusters_map[f"noise-{idx}"] = [idx]
         else:
-            clusters.setdefault(lab, []).append(idx)
-    return list(clusters.values())
+            clusters_map.setdefault(lab, []).append(idx)
+    return list(clusters_map.values())
 
-def cluster_stats_from_members(members: List[int], items: List[Dict[str,Any]]) -> Dict[str,Any]:
-    subset=[items[i] for i in members]
-    uniq_papers=sorted({x["paper_id"] for x in subset})
-    severities=[x.get("severity",3) for x in subset]
-    srcs=[x.get("source","Reported") for x in subset]
-    evidence=[1 if (x.get("evidence_quote")) else 0 for x in subset]
+def cluster_stats_from_members(members: List[int], items: List[Dict[str, Any]]) -> Dict[str, Any]:
+    subset = [items[i] for i in members]
+    uniq_papers = sorted({x["paper_id"] for x in subset})
+    severities = [x.get("severity", 3) for x in subset]
+    srcs = [x.get("source", "Reported") for x in subset]
+    evidence = [1 if (x.get("evidence_quote")) else 0 for x in subset]
     return {
         "paper_coverage": len(uniq_papers),
         "unique_papers": uniq_papers,
         "count": len(subset),
         "avg_severity": float(np.mean(severities) if severities else 0),
         "median_severity": float(np.median(severities) if severities else 0),
-        "reported_share": float(srcs.count("Reported")/len(srcs)) if srcs else 0.0,
-        "inferred_share": float(srcs.count("Inferred")/len(srcs)) if srcs else 0.0,
+        "reported_share": float(srcs.count("Reported") / len(srcs)) if srcs else 0.0,
+        "inferred_share": float(srcs.count("Inferred") / len(srcs)) if srcs else 0.0,
         "evidence_strength": float(np.mean(evidence) if evidence else 0.0),
         "samples": [x["text"] for x in subset[:5]],
         "members_idx": members
     }
 
-def rank_clusters(stats: List[Dict[str,Any]], total_papers: int, rigorous: bool) -> List[int]:
-    scores=[]
+def rank_clusters(stats: List[Dict[str, Any]], total_papers: int, rigorous: bool) -> List[int]:
+    scores = []
     for i, c in enumerate(stats):
-        coverage = c["paper_coverage"]/max(1,total_papers)
-        sev = c["median_severity"]/5.0
-        ev = c.get("evidence_strength",0.0)
-        score = (0.5*coverage + 0.3*sev + 0.2*ev) if rigorous else (0.7*coverage + 0.3*sev)
-        scores.append((score,i))
+        coverage = c["paper_coverage"] / max(1, total_papers)
+        sev = c["median_severity"] / 5.0
+        ev = c.get("evidence_strength", 0.0)
+        score = (0.5 * coverage + 0.3 * sev + 0.2 * ev) if rigorous else (0.7 * coverage + 0.3 * sev)
+        scores.append((score, i))
     scores.sort(reverse=True)
-    return [i for _,i in scores]
+    return [i for _, i in scores]
 
 # ------------- Checklist tagging -------------
 CHECKLIST = [
@@ -544,15 +634,20 @@ CHECKLIST = [
 ]
 
 def llm_tag_gaps(client: OpenAI, model: str, gap_texts: List[str]) -> List[List[str]]:
-    if not gap_texts: return [[] for _ in gap_texts]
+    if not gap_texts:
+        return [[] for _ in gap_texts]
     system = "You assign concise checklist tags to research gaps. Return ONLY JSON."
-    user = ("For each gap, choose zero or more tags from this list:\n" +
-            ", ".join(CHECKLIST) +
-            "\nReturn JSON with {'tags': [['Tag1','Tag2',...], ...]} in the same order as inputs.\n\n" +
-            json.dumps({"gaps": gap_texts}, ensure_ascii=False))
-    content = safe_chat(client, model,
-                        [{"role":"system","content":system},{"role":"user","content":user}],
-                        use_schema=False)
+    user = (
+        "For each gap, choose zero or more tags from this list:\n" +
+        ", ".join(CHECKLIST) +
+        "\nReturn JSON with {'tags': [['Tag1','Tag2',...], ...]} in the same order as inputs.\n\n" +
+        json.dumps({"gaps": gap_texts}, ensure_ascii=False)
+    )
+    content = safe_chat(
+        client, model,
+        [{"role": "system", "content": system}, {"role": "user", "content": user}],
+        use_schema=False
+    )
     try:
         data = parse_possible_json(content)
         return data.get("tags", [[] for _ in gap_texts])
@@ -560,21 +655,25 @@ def llm_tag_gaps(client: OpenAI, model: str, gap_texts: List[str]) -> List[List[
         return [[] for _ in gap_texts]
 
 # ------------- Report generation (narrative / executive) -------------
-def llm_narrative(client: OpenAI, model: str, clusters_payload: Dict[str,Any]) -> str:
-    system = ("You write clear, non-technical academic summaries.\n"
-              "Return plain text only: paragraphs separated by a blank line. No headings or bullets.")
+def llm_narrative(client: OpenAI, model: str, clusters_payload: Dict[str, Any]) -> str:
+    system = (
+        "You write clear, non-technical academic summaries.\n"
+        "Return plain text only: paragraphs separated by a blank line. No headings or bullets."
+    )
     user = (
         "Write 3–5 short paragraphs narrating the main shared gaps (one per paragraph), "
         "then ONE final paragraph recommending the single gap with the best potential, with a brief rationale and a one-sentence next step.\n"
         "Rules: NO lists, NO bullets, NO headings, NO tables, NO explicit numbers/percentages—just prose. <= 600 words.\n\n"
         "JSON:\n" + json.dumps(clusters_payload, ensure_ascii=False)
     )
-    content = safe_chat(client, model,
-                        [{"role":"system","content":system},{"role":"user","content":user}],
-                        use_schema=False)
+    content = safe_chat(
+        client, model,
+        [{"role": "system", "content": system}, {"role": "user", "content": user}],
+        use_schema=False
+    )
     return re.sub(r"`{3,}.*?`{3,}", "", content, flags=re.DOTALL).strip()
 
-def llm_executive_brief(client: OpenAI, model: str, clusters_payload: Dict[str,Any]) -> str:
+def llm_executive_brief(client: OpenAI, model: str, clusters_payload: Dict[str, Any]) -> str:
     system = "You write ultra-concise executive briefs for researchers."
     user = (
         "In <= 220 words total, write:\n"
@@ -583,23 +682,31 @@ def llm_executive_brief(client: OpenAI, model: str, clusters_payload: Dict[str,A
         "No headings, no bullets—just three compact paragraphs.\n\n"
         "JSON:\n" + json.dumps(clusters_payload, ensure_ascii=False)
     )
-    content = safe_chat(client, model,
-                        [{"role":"system","content":system},{"role":"user","content":user}],
-                        use_schema=False)
+    content = safe_chat(
+        client, model,
+        [{"role": "system", "content": system}, {"role": "user", "content": user}],
+        use_schema=False
+    )
     return re.sub(r"`{3,}.*?`{3,}", "", content, flags=re.DOTALL).strip()
 
 # ------------- DOCX (with logo + appendix) -------------
-def docx_from_paragraphs_with_appendix(title: str, paragraphs: List[str],
-                                       appendix_items: List[Dict[str,Any]],
-                                       logo_bytes: Optional[bytes],
-                                       accent_hex: str) -> bytes:
-    if Document is None: return b""
+def docx_from_paragraphs_with_appendix(
+    title: str,
+    paragraphs: List[str],
+    appendix_items: List[Dict[str, Any]],
+    logo_bytes: Optional[bytes],
+    accent_hex: str
+) -> bytes:
+    if Document is None:
+        return b""
     doc = Document()
 
     # margins
     for sec in doc.sections:
-        sec.top_margin = Inches(0.8); sec.bottom_margin = Inches(0.8)
-        sec.left_margin = Inches(0.8); sec.right_margin = Inches(0.8)
+        sec.top_margin = Inches(0.8)
+        sec.bottom_margin = Inches(0.8)
+        sec.left_margin = Inches(0.8)
+        sec.right_margin = Inches(0.8)
 
     # logo (optional)
     if logo_bytes:
@@ -609,7 +716,9 @@ def docx_from_paragraphs_with_appendix(title: str, paragraphs: List[str],
             pass
 
     # title + date
-    h = doc.add_paragraph(title); h.style = "Title"; h.alignment = WD_ALIGN_PARAGRAPH.LEFT
+    h = doc.add_paragraph(title)
+    h.style = "Title"
+    h.alignment = WD_ALIGN_PARAGRAPH.LEFT
     sub = doc.add_paragraph(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
     sub.alignment = WD_ALIGN_PARAGRAPH.LEFT
     doc.add_paragraph()
@@ -617,25 +726,35 @@ def docx_from_paragraphs_with_appendix(title: str, paragraphs: List[str],
     # body
     for ptxt in [p.strip() for p in paragraphs if p.strip()]:
         p = doc.add_paragraph(ptxt)
-        pf = p.paragraph_format; pf.space_after = Pt(6); pf.line_spacing = 1.2
+        pf = p.paragraph_format
+        pf.space_after = Pt(6)
+        pf.line_spacing = 1.2
         p.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
 
     # appendix header
     if appendix_items:
         doc.add_paragraph()
         app_h = doc.add_paragraph("Appendix — Representative Quotes")
-        app_h.runs[0].bold = True
+        if app_h.runs:
+            app_h.runs[0].bold = True
+        else:
+            r = app_h.add_run()
+            r.bold = True
+            r.text = "Appendix — Representative Quotes"
 
         # entries
         for it in appendix_items:
-            line = f"{it.get('paper_id','unknown')} — "
-            if it.get("evidence_page"): line += f"[p. {it.get('evidence_page')}] "
+            line = f"{it.get('paper_id', 'unknown')} — "
+            if it.get("evidence_page"):
+                line += f"[p. {it.get('evidence_page')}] "
             line += f"“{(it.get('evidence_quote') or '').strip()}”"
             para = doc.add_paragraph(line)
             para.paragraph_format.space_after = Pt(4)
             para.paragraph_format.line_spacing = 1.15
 
-    bio = io.BytesIO(); doc.save(bio); return bio.getvalue()
+    bio = io.BytesIO()
+    doc.save(bio)
+    return bio.getvalue()
 
 # =====================================================================================
 # MAIN
@@ -652,8 +771,9 @@ if run_btn:
 
     # 1) Per-paper analysis
     st.subheader("Step 1 — Analyzing papers")
-    per_paper: List[Dict[str,Any]] = []
-    progress = st.progress(0.0); status = st.empty()
+    per_paper: List[Dict[str, Any]] = []
+    progress = st.progress(0.0)
+    status = st.empty()
 
     for i, up in enumerate(uploads, 1):
         status.info(f"Reading: {up.name}")
@@ -661,11 +781,13 @@ if run_btn:
             full_text, pages = extract_text_with_pages(up, ocr_mode)
         except Exception as e:
             st.warning(f"Skipping {up.name}: read error — {e}")
-            progress.progress(i/len(uploads)); continue
+            progress.progress(i / len(uploads))
+            continue
 
         if len(full_text.strip()) < 500:
             st.warning(f"Skipping {up.name}: very little text (consider different OCR language).")
-            progress.progress(i/len(uploads)); continue
+            progress.progress(i / len(uploads))
+            continue
 
         status.info(f"LLM analysis: {up.name}")
         try:
@@ -676,62 +798,91 @@ if run_btn:
                 analysis = analyze_paper_simple(client, model, up.name, full_text[:limit_chars])
         except Exception as e:
             st.warning(f"LLM analysis failed for {up.name}: {e}")
-            progress.progress(i/len(uploads)); continue
+            progress.progress(i / len(uploads))
+            continue
 
         per_paper.append(analysis)
-        progress.progress(i/len(uploads))
+        progress.progress(i / len(uploads))
 
     status.empty()
     if not per_paper:
-        st.error("No papers analyzed successfully."); st.stop()
+        st.error("No papers analyzed successfully.")
+        st.stop()
     st.success(f"Analyzed {len(per_paper)} papers.")
 
     # 2) Build candidate gaps
     st.subheader("Step 2 — Review candidate gaps (accept / edit)")
-    raw_items=[]
+    raw_items: List[Dict[str, Any]] = []
     for a in per_paper:
-        pid=a.get("paper_id") or "unknown"
+        pid = a.get("paper_id") or "unknown"
 
         # reported limitations
         for item in a.get("reported_limitations", []) or []:
             if isinstance(item, dict):
-                txt=(item.get("description") or "").strip()
-                if not txt: continue
+                txt = (item.get("description") or "").strip()
+                if not txt:
+                    continue
                 raw_items.append({
-                    "paper_id": pid, "text": txt, "source":"Reported", "severity":3,
-                    "section": item.get("section",""),
-                    "evidence_quote": item.get("evidence_quote",""),
+                    "paper_id": pid,
+                    "text": txt,
+                    "source": "Reported",
+                    "severity": 3,
+                    "section": item.get("section", ""),
+                    "evidence_quote": item.get("evidence_quote", ""),
                     "evidence_page": item.get("evidence_page", None),
                     "tags": []
                 })
-            elif isinstance(item,(str,int,float)):
-                t=str(item).strip()
+            elif isinstance(item, (str, int, float)):
+                t = str(item).strip()
                 if t:
-                    raw_items.append({"paper_id": pid, "text": t, "source":"Reported",
-                                      "severity":3, "section":"", "evidence_quote":"", "evidence_page":None, "tags":[]})
+                    raw_items.append({
+                        "paper_id": pid,
+                        "text": t,
+                        "source": "Reported",
+                        "severity": 3,
+                        "section": "",
+                        "evidence_quote": "",
+                        "evidence_page": None,
+                        "tags": []
+                    })
 
         # inferred gaps
         for g in a.get("inferred_gaps", []) or []:
             if isinstance(g, dict):
-                desc=(g.get("description") or "").strip()
-                if not desc: continue
-                try: sev=int(round(float(g.get("severity",3))))
-                except: sev=3
+                desc = (g.get("description") or "").strip()
+                if not desc:
+                    continue
+                try:
+                    sev = int(round(float(g.get("severity", 3))))
+                except Exception:
+                    sev = 3
                 raw_items.append({
-                    "paper_id": pid, "text": desc, "source":"Inferred",
-                    "severity": min(max(sev,1),5), "section":"",
-                    "evidence_quote": g.get("evidence_quote",""),
+                    "paper_id": pid,
+                    "text": desc,
+                    "source": "Inferred",
+                    "severity": min(max(sev, 1), 5),
+                    "section": "",
+                    "evidence_quote": g.get("evidence_quote", ""),
                     "evidence_page": g.get("evidence_page", None),
                     "tags": []
                 })
-            elif isinstance(g,(str,int,float)):
-                t=str(g).strip()
+            elif isinstance(g, (str, int, float)):
+                t = str(g).strip()
                 if t:
-                    raw_items.append({"paper_id": pid, "text": t, "source":"Inferred",
-                                      "severity":3, "section":"", "evidence_quote":"", "evidence_page":None, "tags":[]})
+                    raw_items.append({
+                        "paper_id": pid,
+                        "text": t,
+                        "source": "Inferred",
+                        "severity": 3,
+                        "section": "",
+                        "evidence_quote": "",
+                        "evidence_page": None,
+                        "tags": []
+                    })
 
     if not raw_items:
-        st.warning("No gap statements found."); st.stop()
+        st.warning("No gap statements found.")
+        st.stop()
 
     # Tags (optional)
     if rigor:
@@ -741,15 +892,15 @@ if run_btn:
                 x["tags"] = [t for t in tags if t in CHECKLIST][:4]
 
     df = pd.DataFrame([{
-        "Accept": True if (item["source"]=="Reported" or item["evidence_quote"]) else False,
+        "Accept": True if (item["source"] == "Reported" or item["evidence_quote"]) else False,
         "Text": item["text"],
         "Source": item["source"],
         "Severity": item["severity"],
-        "Section": item.get("section",""),
-        "EvidenceQuote": item.get("evidence_quote",""),
-        "EvidencePage": item.get("evidence_page",""),
-        "Tags": ", ".join(item.get("tags",[])),
-        "PaperID": item["paper_id"],
+        "Section": item.get("section", ""),
+        "EvidenceQuote": item.get("evidence_quote", ""),
+        "EvidencePage": item.get("evidence_page", ""),
+        "Tags": ", ".join(item.get("tags", [])),
+        "PaperID": item["paper_id"]
     } for item in raw_items])
 
     st.caption("Uncheck to exclude; edit text/evidence freely before clustering.")
@@ -758,40 +909,42 @@ if run_btn:
         column_config={
             "Accept": st.column_config.CheckboxColumn(),
             "Text": st.column_config.TextColumn(width="large"),
-            "Severity": st.column_config.NumberColumn(min_value=1, max_value=5, step=1),
+            "Severity": st.column_config.NumberColumn(min_value=1, max_value=5, step=1)
         }
     )
 
-    # CSV export (accepted gaps) — BEFORE clustering so you can export raw approvals
-    def df_to_csv_bytes(df: pd.DataFrame) -> bytes:
-        return df.to_csv(index=False).encode("utf-8")
+    # CSV export (edited snapshot before clustering)
+    def df_to_csv_bytes(df_in: pd.DataFrame) -> bytes:
+        return df_in.to_csv(index=False).encode("utf-8")
 
     st.download_button(
         "⬇️ Download CSV of current (edited) gaps",
         data=df_to_csv_bytes(edited),
         file_name="accepted_gaps_edited.csv",
         mime="text/csv",
-        use_container_width=True,
+        use_container_width=True
     )
 
     proceed = st.button("Cluster accepted gaps", type="primary")
     if not proceed:
         st.stop()
 
-    accepted=[]
+    accepted: List[Dict[str, Any]] = []
     for row, base in zip(edited.to_dict("records"), raw_items):
-        if not row["Accept"]: continue
+        if not row["Accept"]:
+            continue
         item = base.copy()
         item["text"] = row["Text"].strip()
         item["severity"] = int(row["Severity"])
-        item["section"] = row.get("Section","")
-        item["evidence_quote"] = row.get("EvidenceQuote","")
-        item["evidence_page"] = row.get("EvidencePage","")
-        item["tags"] = [t.strip() for t in (row.get("Tags","") or "").split(",") if t.strip()]
+        item["section"] = row.get("Section", "")
+        item["evidence_quote"] = row.get("EvidenceQuote", "")
+        item["evidence_page"] = row.get("EvidencePage", "")
+        item["tags"] = [t.strip() for t in (row.get("Tags", "") or "").split(",") if t.strip()]
         accepted.append(item)
 
     if not accepted:
-        st.error("No gaps selected."); st.stop()
+        st.error("No gaps selected.")
+        st.stop()
 
     # 3) Clustering
     st.subheader("Step 3 — Clustering shared gaps")
@@ -800,7 +953,7 @@ if run_btn:
 
     clusters_members = hdbscan_cluster(vecs) if rigor else greedy_cluster(vecs, threshold=sim_threshold)
 
-    stats=[]
+    stats: List[Dict[str, Any]] = []
     for mem in clusters_members:
         stats.append(cluster_stats_from_members(mem, accepted))
 
@@ -808,8 +961,8 @@ if run_btn:
     top_idx = order[0] if order else 0
 
     # Build payload for LLM report and appendix mapping
-    clusters_payload = {"total_papers": len(per_paper), "clusters": []}
-    appendix_items: List[Dict[str,Any]] = []
+    clusters_payload: Dict[str, Any] = {"total_papers": len(per_paper), "clusters": []}
+    appendix_items: List[Dict[str, Any]] = []
     for rank_pos, ci in enumerate(order):
         c = stats[ci]
         clusters_payload["clusters"].append({
@@ -817,24 +970,23 @@ if run_btn:
             "label": f"Cluster {ci}",
             "paper_coverage": c["paper_coverage"],
             "count": c["count"],
-            "avg_severity": round(c["avg_severity"],2),
-            "median_severity": round(c["median_severity"],2),
-            "reported_share": round(c["reported_share"],3),
-            "inferred_share": round(c["inferred_share"],3),
-            "evidence_strength": round(c["evidence_strength"],3),
+            "avg_severity": round(c["avg_severity"], 2),
+            "median_severity": round(c["median_severity"], 2),
+            "reported_share": round(c["reported_share"], 3),
+            "inferred_share": round(c["inferred_share"], 3),
+            "evidence_strength": round(c["evidence_strength"], 3),
             "example_statements": c["samples"],
-            "is_recommended": (ci == top_idx),
+            "is_recommended": (ci == top_idx)
         })
-        # Gather representative quotes for appendix (prioritize reported with quotes)
+        # Collect representative quotes for appendix (limit total to keep doc small)
         for idx in c["members_idx"]:
             it = accepted[idx]
             if it.get("evidence_quote"):
                 appendix_items.append({
-                    "paper_id": it.get("paper_id","unknown"),
-                    "evidence_quote": it.get("evidence_quote",""),
-                    "evidence_page": it.get("evidence_page",""),
+                    "paper_id": it.get("paper_id", "unknown"),
+                    "evidence_quote": it.get("evidence_quote", ""),
+                    "evidence_page": it.get("evidence_page", "")
                 })
-            # Limit appendix size to keep doc short
             if len(appendix_items) >= 40:
                 break
 
@@ -860,7 +1012,6 @@ if run_btn:
     st.text_area("Report preview", value=text, height=260)
 
     # Build DOCX with logo + appendix
-    logo_bytes = logo_file.read() if logo_file else None
     paragraphs = [p.strip() for p in text.split("\n\n") if p.strip()]
     docx_bytes = docx_from_paragraphs_with_appendix(
         title, paragraphs, appendix_items, logo_bytes, accent
@@ -872,7 +1023,7 @@ if run_btn:
             data=docx_bytes,
             file_name=("executive_brief.docx" if brief_mode else "final_report_narrative.docx"),
             mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-            use_container_width=True,
+            use_container_width=True
         )
     else:
         st.warning("python-docx not installed; cannot build DOCX.")
@@ -883,10 +1034,10 @@ if run_btn:
         "Text": it["text"],
         "Source": it["source"],
         "Severity": it["severity"],
-        "Section": it.get("section",""),
-        "EvidenceQuote": it.get("evidence_quote",""),
-        "EvidencePage": it.get("evidence_page",""),
-        "Tags": ", ".join(it.get("tags",[]))
+        "Section": it.get("section", ""),
+        "EvidenceQuote": it.get("evidence_quote", ""),
+        "EvidencePage": it.get("evidence_page", ""),
+        "Tags": ", ".join(it.get("tags", []))
     } for it in accepted])
 
     st.download_button(
@@ -894,5 +1045,5 @@ if run_btn:
         data=final_df.to_csv(index=False).encode("utf-8"),
         file_name="accepted_gaps_final.csv",
         mime="text/csv",
-        use_container_width=True,
+        use_container_width=True
     )
