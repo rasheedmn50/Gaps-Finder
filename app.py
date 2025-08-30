@@ -138,20 +138,19 @@ def get_logo_bytes() -> Optional[bytes]:
         return None
 
 def inject_brand_css(accent_hex: str):
-    st.markdown(
-        f"""
-        <style>
-        .app-title {{
-            background: linear-gradient(90deg, {accent_hex}22, transparent);
-            border-left: 6px solid {accent_hex};
-            padding: 10px 14px;
-            border-radius: 10px;
-            margin-bottom: 10px;
-        }}
-        </style>
-        """,
-        unsafe_allow_html=True
+    # Plain string (not f-string) to avoid curly-brace issues
+    css = (
+        "<style>\n"
+        ".app-title {\n"
+        "  background: linear-gradient(90deg, " + accent_hex + "22, transparent);\n"
+        "  border-left: 6px solid " + accent_hex + ";\n"
+        "  padding: 10px 14px;\n"
+        "  border-radius: 10px;\n"
+        "  margin-bottom: 10px;\n"
+        "}\n"
+        "</style>"
     )
+    st.markdown(css, unsafe_allow_html=True)
 
 inject_brand_css(accent)
 logo_bytes = get_logo_bytes()
@@ -286,7 +285,8 @@ def paper_schema_rigorous(name="paper_gap_v2") -> Dict[str, Any]:
         "name": name,
         "strict": True,
         "schema": {
-            "type": "object", "additionalProperties": True,
+            "type": "object",
+            "additionalProperties": True,
             "properties": {
                 "paper_id": {"type": "string"},
                 "title": {"type": "string"},
@@ -295,32 +295,41 @@ def paper_schema_rigorous(name="paper_gap_v2") -> Dict[str, Any]:
                 "methodology": {"type": "string"},
                 "reported_limitations": {
                     "type": "array",
-                    "items": {"type": "object", "additionalProperties": True,
-                              "properties": {
-                                  "description": {"type": "string"},
-                                  "section": {"type": "string"},
-                                  "evidence_quote": {"type": "string"},
-                                  "evidence_page": {"type": ["integer", "array", "string", "null"]},
-                                  "confidence": {"type": ["number", "integer"]}
-                              },
-                              "required": ["description", "section", "evidence_quote"]}}
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": True,
+                        "properties": {
+                            "description": {"type": "string"},
+                            "section": {"type": "string"},
+                            "evidence_quote": {"type": "string"},
+                            "evidence_page": {"type": ["integer", "array", "string", "null"]},
+                            "confidence": {"type": ["number", "integer"]}
+                        },
+                        "required": ["description", "section", "evidence_quote"]
+                    }
                 },
                 "reported_future_work": {"type": "array", "items": {"type": ["string", "object"]}},
                 "inferred_gaps": {
                     "type": "array",
-                    "items": {"type": "object", "additionalProperties": True,
-                              "properties": {
-                                  "description": {"type": "string"},
-                                  "category": {"type": "string"},
-                                  "severity": {"type": ["integer", "number"]},
-                                  "confidence": {"type": ["number", "integer"]},
-                                  "evidence_quote": {"type": ["string", "null"]},
-                                  "evidence_page": {"type": ["integer", "array", "string", "null"]}
-                              },
-                              "required": ["description", "category", "severity", "confidence"]}}
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": True,
+                        "properties": {
+                            "description": {"type": "string"},
+                            "category": {"type": "string"},
+                            "severity": {"type": ["integer", "number"]},
+                            "confidence": {"type": ["number", "integer"]},
+                            "evidence_quote": {"type": ["string", "null"]},
+                            "evidence_page": {"type": ["integer", "array", "string", "null"]}
+                        },
+                        "required": ["description", "category", "severity", "confidence"]
+                    }
+                }
             },
-            "required": ["paper_id", "title", "domain", "topic_keywords", "methodology",
-                         "reported_limitations", "reported_future_work", "inferred_gaps"]
+            "required": [
+                "paper_id", "title", "domain", "topic_keywords", "methodology",
+                "reported_limitations", "reported_future_work", "inferred_gaps"
+            ]
         }
     }
 
@@ -691,9 +700,10 @@ def llm_two_paragraph_report(client: OpenAI, model: str, clusters_payload: Dict[
             "Paragraph 2: explain, in simple steps, how to build on that important gap to create genuine novelty for a future paper.\n"
             "Rules: no lists, no bullets, no headings, no numbers or percentages, no quotes, no curly braces. Plain sentences only.\n\n"
             "JSON INPUT YOU SHOULD READ (do not copy):\n" + json.dumps(clusters_payload, ensure_ascii=False))
-    content = safe_chat(client, model,
-                        [{"role": "system", "content": system}, {"role": "user", "content": user}],
-                        use_schema=False)
+    content = safe_chat(
+        client, model,
+        [{"role": "system", "content": system}, {"role": "user", "content": user}],
+        use_schema=False)
     return clean_to_two_paragraphs(content)
 
 # Other styles
