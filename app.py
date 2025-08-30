@@ -1,15 +1,26 @@
 #!/usr/bin/env python3
-# Streamlit Paper Gap Analyzer — two-paragraph clean report + DOCX
-# ----------------------------------------------------------------
-# This version keeps your previous working flow and adds:
-#   • New report style: “Two-paragraph (recommended)”
-#   • Hard text sanitizer (removes {"text": ...}, quotes, code fences, stray escapes)
-#   • Guarantees exactly two paragraphs: 1) shared gaps + most important gap; 2) how to build novelty
-#   • DOCX still includes your logo + optional Appendix of quotes
+# Streamlit Paper Gap Analyzer — clean 2-paragraph DOCX + OCR + clustering + CSV + appendix
+# -----------------------------------------------------------------------------------------
+# Upload up to 50 PDFs/DOCX/TXT. Analyze shared research gaps, cluster similar gaps,
+# and export a clean, branded **two-paragraph** Word report (plus other styles).
 #
-# Run:
+# Features:
+#   • High-Rigor mode (evidence quotes + page markers + section-aware prompts)
+#   • Greedy clustering (default) or HDBSCAN (if installed) to group similar gaps
+#   • Reviewer grid to accept/edit gaps before clustering (default Accept=True)
+#   • Optional checklist tagging (TRIPOD-AI / CONSORT-AI inspired)
+#   • OCR for scanned PDFs (pypdfium2 + pytesseract): Auto / Force / Off
+#   • Branding: persistent logo (assets/logo.png) or upload + choose accent color
+#   • Downloads: CSV (edited/final), DOCX (main + appendix), plus TXT/RTF fallbacks
+#   • New “Two-paragraph (recommended)” style: exactly two clean paragraphs,
+#     paragraph 1 = shared gaps + most important gap, paragraph 2 = how to build novelty
+#
+# Run locally:
 #   pip install -r requirements.txt
 #   streamlit run app.py
+#
+# On Streamlit Cloud:
+#   Add a secret OPENAI_API_KEY in App settings, or paste in the sidebar.
 #
 from __future__ import annotations
 
@@ -25,7 +36,7 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-# --- Optional deps (same as before) ---
+# Optional deps
 try:
     from pypdf import PdfReader
     from pypdf.errors import PdfReadWarning
@@ -35,7 +46,7 @@ except Exception:
 
 try:
     import pytesseract
-    from PIL import Image  # used by pytesseract
+    from PIL import Image  # noqa: F401  (pytesseract needs PIL)
     import pypdfium2 as pdfium
     OCR_AVAILABLE = True
 except Exception:
@@ -61,7 +72,10 @@ except Exception:
 
 from openai import OpenAI
 
-# ------------- UI config -------------
+
+# ------------------------------------------------------------
+# UI + Defaults
+# ------------------------------------------------------------
 st.set_page_config(page_title="Paper Gap Analyzer", page_icon="🧠", layout="wide")
 
 DEFAULT_MODEL = "gpt-5"
@@ -69,28 +83,32 @@ DEFAULT_EMBEDDING = "text-embedding-3-large"
 MAX_PAPERS = 50
 MAX_CHARS_PER_PAPER = 80_000
 
-# ---- Safe rerun helper ----
+# Safe rerun helper (new Streamlit uses st.rerun)
 def _safe_rerun():
     try:
         st.rerun()
     except Exception:
         try:
-            st.experimental_rerun()  # legacy
+            st.experimental_rerun()
         except Exception:
             pass
 
-# ---- Session boot ----
-if "stage" not in st.session_state:
-    st.session_state.stage = "upload"
-    st.session_state.files = []
-    st.session_state.per_paper = []
-    st.session_state.accepted = []
-    st.session_state.stats = []
-    st.session_state.order = []
-    st.session_state.clusters_payload = {}
-    st.session_state.appendix_items = []
+# Session init
+ss = st.session_state
+if "stage" not in ss:
+    ss.stage = "upload"
+    ss.files = []         # [{'name':..., 'bytes':..., 'type': 'pdf|docx|txt'}]
+    ss.per_paper = []     # per-paper analyses (dicts)
+    ss.accepted = []      # accepted gaps for clustering
+    ss.stats = []         # cluster stats list
+    ss.order = []         # ranked cluster indices
+    ss.payload = {}       # clusters payload for the report
+    ss.appendix = []      # appendix quotes
 
-# ------------- Sidebar -------------
+
+# ------------------------------------------------------------
+# Sidebar
+# ------------------------------------------------------------
 st.sidebar.title("⚙️ Settings")
 
 api_key_input = st.sidebar.text_input("OpenAI API Key", type="password", placeholder="sk-…")
@@ -98,15 +116,22 @@ api_key = api_key_input or st.secrets.get("OPENAI_API_KEY", "")
 
 model = st.sidebar.text_input("Chat Model", value=DEFAULT_MODEL)
 embedding_model = st.sidebar.text_input("Embedding Model", value=DEFAULT_EMBEDDING)
-limit_chars = st.sidebar.number_input("Max chars per paper", 20000, 180000, MAX_CHARS_PER_PAPER, 2000)
+limit_chars = st.sidebar.number_input("Max chars per paper", 20_000, 180_000, MAX_CHARS_PER_PAPER, 2_000)
 
 st.sidebar.markdown("---")
 rigor = st.sidebar.toggle(
     "High-Rigor mode",
     value=True,
-    help="Evidence quotes + pages, section-aware prompts, HDBSCAN clustering, reviewer approval, checklist tags."
+    help="Evidence quotes + page markers + section-aware prompts + (if available) HDBSCAN clustering."
 )
-sim_threshold = st.sidebar.slider("Similarity threshold (fallback clustering)", 0.70, 0.90, 0.82, 0.01)
+sim_threshold = st.sidebar.slider("Similarity threshold (greedy clustering)", 0.70, 0.92, 0.82, 0.01)
+
+st.sidebar.markdown("---")
+tagging_on = st.sidebar.toggle(
+    "Checklist tagging (extra LLM calls)",
+    value=False,
+    help="Add concise tags like Fairness/Equity, Reproducibility, etc."
+)
 
 st.sidebar.markdown("---")
 st.sidebar.subheader("🖼 Branding")
@@ -119,14 +144,17 @@ ocr_mode = st.sidebar.selectbox(
     "OCR mode",
     options=["Auto (OCR blank/low-text pages)", "Force OCR (all PDF pages)", "Off"],
     index=0 if OCR_AVAILABLE else 2,
-    help="OCR needs pytesseract + pypdfium2."
+    help="OCR uses pypdfium2 + pytesseract."
 )
 
 st.sidebar.markdown(
     "✅ DOCX: **available**" if Document is not None else "⚠️ DOCX: **unavailable** (RTF/TXT fallback will be used)"
 )
 
-# ------------- Branding helpers -------------
+
+# ------------------------------------------------------------
+# Branding helpers
+# ------------------------------------------------------------
 DEFAULT_LOGO_PATH = "assets/logo.png"
 
 def get_logo_bytes() -> Optional[bytes]:
@@ -160,36 +188,19 @@ def inject_brand_css(accent_hex: str):
 inject_brand_css(accent)
 logo_bytes = get_logo_bytes()
 
-# ------------- Header -------------
-c_logo, c_title = st.columns([1, 5])
-with c_logo:
+# Header
+left, right = st.columns([1, 5])
+with left:
     if logo_bytes:
         st.image(logo_bytes, width="stretch")
-with c_title:
+with right:
     st.markdown('<div class="app-title"><h1 style="margin:0;">🧠 Paper Gap Analyzer</h1></div>', unsafe_allow_html=True)
-    st.caption("Find shared research gaps across uploaded papers and export a clean, branded report.")
+    st.caption("Find shared research gaps across uploaded papers and export a clean, branded two-paragraph Word report.")
 
-# ------------- Uploader & controls -------------
-uploads = st.file_uploader(
-    "Upload your papers (PDF / DOCX / TXT)",
-    type=["pdf", "docx", "txt"],
-    accept_multiple_files=True
-)
-if uploads and len(uploads) > MAX_PAPERS:
-    st.warning(f"Only the first {MAX_PAPERS} files will be analyzed.")
-    uploads = uploads[:MAX_PAPERS]
 
-c1, c2 = st.columns([1, 1])
-with c1:
-    run_btn = st.button("Analyze", type="primary", width="stretch")
-with c2:
-    clear_btn = st.button("Reset", width="stretch")
-
-if clear_btn:
-    st.session_state.clear()
-    _safe_rerun()
-
-# ------------- Robust numeric parsers -------------
+# ------------------------------------------------------------
+# Robust numeric parsers
+# ------------------------------------------------------------
 def _to_float(s):
     try:
         return float(s)
@@ -240,7 +251,10 @@ def parse_severity(x) -> int:
                 return v
     return 3
 
-# ------------- OpenAI helpers -------------
+
+# ------------------------------------------------------------
+# OpenAI helpers
+# ------------------------------------------------------------
 def build_client(key: str) -> OpenAI:
     if not key or not key.startswith("sk-"):
         raise RuntimeError("Please provide a valid OpenAI API key.")
@@ -288,7 +302,10 @@ def safe_chat(client: OpenAI, model: str, messages: List[Dict[str, str]], *,
             time.sleep(1.0 * attempt)
     raise RuntimeError(f"LLM request failed after retries: {last_err}")
 
-# ------------- Schemas & normalization -------------
+
+# ------------------------------------------------------------
+# Schemas & normalization
+# ------------------------------------------------------------
 def paper_schema_simple(name="paper_gap") -> Dict[str, Any]:
     return {
         "name": name,
@@ -453,7 +470,10 @@ def normalize_rigorous(data: Dict[str, Any], paper_id: str) -> Dict[str, Any]:
     out["reported_limitations"] = rep
     return out
 
-# ------------- File reading + OCR -------------
+
+# ------------------------------------------------------------
+# File reading + OCR
+# ------------------------------------------------------------
 def pdf_text_pages_pypdf(data: bytes) -> List[str]:
     if PdfReader is None:
         raise RuntimeError("pypdf not installed")
@@ -495,16 +515,15 @@ def read_docx_stream(file_bytes: bytes) -> str:
     d = Document(io.BytesIO(file_bytes))
     return "\n".join(p.text for p in d.paragraphs)
 
-def extract_text_with_pages(upload, ocr_mode: str) -> Tuple[str, List[str]]:
-    name = upload.name.lower()
-    if name.endswith(".txt"):
-        t = upload.read().decode("utf-8", errors="ignore")
+def extract_text_with_pages_from_bytes(name: str, data: bytes, ocr_mode: str) -> Tuple[str, List[str]]:
+    lname = name.lower()
+    if lname.endswith(".txt"):
+        t = data.decode("utf-8", errors="ignore")
         return t, [t]
-    data = upload.read()
-    if name.endswith(".docx"):
+    if lname.endswith(".docx"):
         t = read_docx_stream(data)
         return t, [t]
-    if name.endswith(".pdf"):
+    if lname.endswith(".pdf"):
         pypdf_pages = pdf_text_pages_pypdf(data)
         if ocr_mode == "Off" or not OCR_AVAILABLE:
             pages = pypdf_pages
@@ -513,6 +532,7 @@ def extract_text_with_pages(upload, ocr_mode: str) -> Tuple[str, List[str]]:
             if not pages or all(len((x or "").strip()) == 0 for x in pages):
                 pages = pypdf_pages
         else:
+            # Auto OCR only pages with low text
             pages = pypdf_pages[:]
             to_ocr = [i for i, t in enumerate(pages) if len((t or "").strip()) < 40]
             if to_ocr:
@@ -527,7 +547,10 @@ def extract_text_with_pages(upload, ocr_mode: str) -> Tuple[str, List[str]]:
         return "\n\n".join(marked), pages
     raise ValueError("Unsupported file type")
 
-# ------------- Sectioning (heuristic) -------------
+
+# ------------------------------------------------------------
+# Sectioning (heuristic)
+# ------------------------------------------------------------
 SECTION_HEADERS = [
     r"\babstract\b", r"\bbackground\b", r"\bintroduction\b", r"\bmethods?\b",
     r"\bmaterials and methods\b", r"\bresults\b", r"\bdiscussion\b",
@@ -547,7 +570,10 @@ def split_into_sections(text: str) -> Dict[str, str]:
         sections[hdr.strip().title()] = text[pos:end].strip()
     return sections
 
-# ------------- LLM Analysis -------------
+
+# ------------------------------------------------------------
+# LLM Analysis
+# ------------------------------------------------------------
 def analyze_paper_simple(client: OpenAI, model: str, paper_id: str, text: str) -> Dict[str, Any]:
     if len(text) > MAX_CHARS_PER_PAPER:
         text = text[:MAX_CHARS_PER_PAPER]
@@ -600,7 +626,10 @@ def analyze_paper_rigorous(client: OpenAI, model: str, paper_id: str, sectioned_
     )
     return normalize_rigorous(parse_possible_json(content), paper_id)
 
-# ------------- Embeddings & clustering -------------
+
+# ------------------------------------------------------------
+# Embeddings & clustering
+# ------------------------------------------------------------
 def embed(client: OpenAI, embedding_model: str, texts: List[str]) -> np.ndarray:
     out = []
     if not texts:
@@ -682,32 +711,58 @@ def rank_clusters(stats: List[Dict[str, Any]], total_papers: int, rigorous: bool
     scores.sort(reverse=True)
     return [i for _, i in scores]
 
-# ------------- (NEW) Sanitizer + two-paragraph writer -------------
+
+# ------------------------------------------------------------
+# Optional: checklist tagging LLM
+# ------------------------------------------------------------
+CHECKLIST = [
+    "ExternalValidation", "ProspectiveValidation", "Calibration", "Fairness/Equity",
+    "Reproducibility", "ReportingCompleteness", "Safety/ClinicalRisk", "DataShift/Generalizability",
+    "ComparatorAdequacy", "Confounding/Bias", "Ethics/Governance", "Privacy"
+]
+
+def llm_tag_gaps(client: OpenAI, model: str, gap_texts: List[str]) -> List[List[str]]:
+    if not gap_texts:
+        return [[] for _ in gap_texts]
+    system = "You assign concise checklist tags to research gaps. Return ONLY JSON."
+    user = (
+        "For each gap, choose zero or more tags from this list:\n" +
+        ", ".join(CHECKLIST) +
+        "\nReturn JSON with {'tags': [['Tag1','Tag2',...], ...]} in the same order as inputs.\n\n" +
+        json.dumps({"gaps": gap_texts}, ensure_ascii=False)
+    )
+    content = safe_chat(
+        client, model,
+        [{"role": "system", "content": system}, {"role": "user", "content": user}],
+        use_schema=False
+    )
+    try:
+        data = parse_possible_json(content)
+        return data.get("tags", [[] for _ in gap_texts])
+    except Exception:
+        return [[] for _ in gap_texts]
+
+
+# ------------------------------------------------------------
+# (NEW) Two-paragraph writer + sanitizer
+# ------------------------------------------------------------
 def _strip_code_fences(s: str) -> str:
     return re.sub(r"^```+.*?```+$", "", s.strip(), flags=re.DOTALL)
 
 def _remove_json_wrappers(s: str) -> str:
-    # common wrappers like {"text": "...."} or { "paragraphs": ["..",".."] }
     s2 = s.strip()
-    # 1) single "text" wrapper
     m = re.match(r'^\s*\{\s*"text"\s*:\s*"(.*)"\s*\}\s*$', s2, flags=re.DOTALL)
     if m:
         return m.group(1)
-    # 2) paragraphs array wrapper
     m = re.match(r'^\s*\{\s*"(?:paragraphs?|paras?)"\s*:\s*\[(.*)\]\s*\}\s*$', s2, flags=re.DOTALL)
     if m:
         inner = m.group(1)
-        # split quoted strings "..." , "..."
         parts = re.findall(r'"([^"]+)"', inner)
         return "\n\n".join(parts)
     return s
 
 def _basic_deescape(s: str) -> str:
-    # remove excessive escaped newlines and stray quotes/backslashes at edges
     s = s.replace("\\n", "\n")
-    s = re.sub(r'\s+"', '"', s)
-    s = re.sub(r'"\s+', '"', s)
-    # drop leading/trailing quotes if they wrap the whole thing
     if s.startswith('"') and s.endswith('"'):
         s = s[1:-1]
     return s
@@ -716,29 +771,20 @@ def clean_to_two_paragraphs(text: str) -> List[str]:
     s = _strip_code_fences(text)
     s = _remove_json_wrappers(s)
     s = _basic_deescape(s)
-    # remove any lingering { } that are obviously JSON noise
     s = re.sub(r'^\s*\{|\}\s*$', '', s.strip())
-    # collapse triple newlines
     s = re.sub(r"\n{3,}", "\n\n", s)
-    # split into paragraphs
     paras = [p.strip() for p in re.split(r"\n\s*\n", s) if p.strip()]
     if len(paras) >= 2:
         return [paras[0], paras[1]]
     if len(paras) == 1:
-        # split by sentences to form two paras
         sentences = re.split(r'(?<=[\.\!\?])\s+', paras[0])
         mid = max(1, len(sentences)//2)
         p1 = " ".join(sentences[:mid]).strip()
         p2 = " ".join(sentences[mid:]).strip()
-        return [p1, p2] if p2 else [p1, "This paragraph explains how to build on the most important gap with a clear and simple plan."]
+        return [p1, p2] if p2 else [p1, "This paragraph explains how to build on the most important gap with a clear plan."]
     return ["", ""]
 
 def llm_two_paragraph_report(client: OpenAI, model: str, clusters_payload: Dict[str, Any]) -> List[str]:
-    """
-    EXACTLY two paragraphs, plain language, beautiful but simple.
-    1) Describe the shared gaps and clearly name the single most important gap.
-    2) Explain how to build on that gap to create novelty (what to do next).
-    """
     system = (
         "You write clear, pleasant prose in very simple words for busy researchers. "
         "Return plain text only. No lists, no headings, no bullets, no code, no JSON, no braces."
@@ -747,8 +793,7 @@ def llm_two_paragraph_report(client: OpenAI, model: str, clusters_payload: Dict[
         "Write EXACTLY two short paragraphs.\n"
         "Paragraph 1: explain the main gaps shared across these papers in simple words and CLEARLY name the one most important gap.\n"
         "Paragraph 2: explain, in simple steps, how to build on that important gap to create genuine novelty for a future paper.\n"
-        "Rules: no lists, no bullets, no headings, no numbers or percentages, no quotes, no curly braces. "
-        "Plain sentences only.\n\n"
+        "Rules: no lists, no bullets, no headings, no numbers or percentages, no quotes, no curly braces. Plain sentences only.\n\n"
         "JSON INPUT YOU SHOULD READ (do not copy):\n" + json.dumps(clusters_payload, ensure_ascii=False)
     )
     content = safe_chat(
@@ -758,7 +803,60 @@ def llm_two_paragraph_report(client: OpenAI, model: str, clusters_payload: Dict[
     )
     return clean_to_two_paragraphs(content)
 
-# ------------- DOCX (with logo + appendix) -------------
+
+# ------------------------------------------------------------
+# Other report styles (kept for flexibility)
+# ------------------------------------------------------------
+def llm_narrative(client: OpenAI, model: str, clusters_payload: Dict[str, Any]) -> str:
+    system = "You write clear, non-technical academic summaries. Return plain text only."
+    user = (
+        "Write 3–5 short paragraphs narrating the main shared gaps (one per paragraph), "
+        "then ONE final paragraph recommending the single gap with the best potential, with a brief rationale and a one-sentence next step.\n"
+        "Rules: NO lists, NO bullets, NO headings, NO tables, NO explicit numbers/percentages—just prose. <= 600 words.\n\n"
+        "JSON:\n" + json.dumps(clusters_payload, ensure_ascii=False)
+    )
+    content = safe_chat(
+        client, model,
+        [{"role": "system", "content": system}, {"role": "user", "content": user}],
+        use_schema=False
+    )
+    return re.sub(r"`{3,}.*?`{3,}", "", content, flags=re.DOTALL).strip()
+
+def llm_executive_brief(client: OpenAI, model: str, clusters_payload: Dict[str, Any]) -> str:
+    system = "You write ultra-concise executive briefs for researchers."
+    user = (
+        "In <= 220 words total, write:\n"
+        "• Two short paragraphs that plainly describe the main gaps (no lists, no numbers).\n"
+        "• One final 2–3 sentence recommendation naming the best gap to pursue and a concrete starting step.\n"
+        "No headings, no bullets—just three compact paragraphs.\n\n"
+        "JSON:\n" + json.dumps(clusters_payload, ensure_ascii=False)
+    )
+    content = safe_chat(
+        client, model,
+        [{"role": "system", "content": system}, {"role": "user", "content": user}],
+        use_schema=False
+    )
+    return re.sub(r"`{3,}.*?`{3,}", "", content, flags=re.DOTALL).strip()
+
+def llm_plain_language(client: OpenAI, model: str, clusters_payload: Dict[str, Any]) -> str:
+    system = "You explain research in very simple words. Short sentences. No jargon. Plain text only."
+    user = (
+        "Write 3–4 short paragraphs in very simple words that explain the main gaps shared across these papers. "
+        "Then add ONE final paragraph that clearly says which single gap is best to work on next and one simple way to start. "
+        "No lists, bullets, headings, or numbers. <= 400 words total.\n\n"
+        "JSON:\n" + json.dumps(clusters_payload, ensure_ascii=False)
+    )
+    content = safe_chat(
+        client, model,
+        [{"role": "system", "content": system}, {"role": "user", "content": user}],
+        use_schema=False
+    )
+    return re.sub(r"`{3,}.*?`{3,}", "", content, flags=re.DOTALL).strip()
+
+
+# ------------------------------------------------------------
+# DOCX / RTF / TXT writers
+# ------------------------------------------------------------
 def docx_from_paragraphs_with_appendix(
     title: str,
     paragraphs: List[str],
@@ -769,45 +867,33 @@ def docx_from_paragraphs_with_appendix(
     if Document is None:
         return b""
     doc = Document()
-
-    # margins
     for sec in doc.sections:
         sec.top_margin = Inches(0.8)
         sec.bottom_margin = Inches(0.8)
         sec.left_margin = Inches(0.8)
         sec.right_margin = Inches(0.8)
-
-    # logo (optional)
     if logo_bytes:
         try:
             doc.add_picture(io.BytesIO(logo_bytes), width=Inches(1.4))
         except Exception:
             pass
-
-    # title + date
     h = doc.add_paragraph(title)
     h.style = "Title"
     h.alignment = WD_ALIGN_PARAGRAPH.LEFT
     sub = doc.add_paragraph(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
     sub.alignment = WD_ALIGN_PARAGRAPH.LEFT
     doc.add_paragraph()
-
-    # body (two paragraphs)
     for ptxt in [p.strip() for p in paragraphs if p.strip()]:
         p = doc.add_paragraph(ptxt)
         pf = p.paragraph_format
         pf.space_after = Pt(8)
         pf.line_spacing = 1.25
         p.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
-
-    # appendix header
     if appendix_items:
         doc.add_paragraph()
         app_h = doc.add_paragraph("Appendix — Representative Quotes")
         if app_h.runs:
             app_h.runs[0].bold = True
-
-        # entries
         for it in appendix_items[:40]:
             line = f"{it.get('paper_id', 'unknown')} — "
             if it.get("evidence_page"):
@@ -816,102 +902,131 @@ def docx_from_paragraphs_with_appendix(
             para = doc.add_paragraph(line)
             para.paragraph_format.space_after = Pt(4)
             para.paragraph_format.line_spacing = 1.15
-
     bio = io.BytesIO()
     doc.save(bio)
     return bio.getvalue()
 
-# =====================================================================================
-# MAIN FLOW
-# =====================================================================================
-if run_btn:
+def rtf_from_paragraphs(title: str, paras: List[str]) -> bytes:
+    def esc(s: str) -> str:
+        return s.replace("\\", r"\\").replace("{", r"\{").replace("}", r"\}")
+    body = "".join([esc(p) + r"\par " for p in paras])
+    return (r"{\rtf1\ansi\deff0\fs28 \b " + esc(title) + r"\b0\par " + body + "}").encode("utf-8")
+
+def txt_from_paragraphs(title: str, paras: List[str]) -> bytes:
+    return ("\n\n".join([title, ""] + paras)).encode("utf-8")
+
+
+# ------------------------------------------------------------
+# UPLOAD + CONTROLS
+# ------------------------------------------------------------
+uploaded = st.file_uploader("Upload your papers (PDF / DOCX / TXT)", type=["pdf", "docx", "txt"], accept_multiple_files=True)
+col_u1, col_u2 = st.columns([1, 1])
+start_btn = col_u1.button("Analyze", type="primary", width="stretch")
+reset_btn = col_u2.button("Reset", width="stretch")
+
+if reset_btn:
+    ss.clear()
+    _safe_rerun()
+
+# Capture uploads into session as bytes (survive re-runs)
+if uploaded:
+    files_list = []
+    for uf in uploaded[:MAX_PAPERS]:
+        try:
+            data = uf.read()
+            files_list.append({"name": uf.name, "bytes": data, "type": uf.type})
+        except Exception:
+            pass
+    if files_list:
+        ss.files = files_list
+
+
+# ------------------------------------------------------------
+# Step 1 — Analyze papers
+# ------------------------------------------------------------
+if start_btn:
     if not api_key:
-        st.error("Please enter your OpenAI API key (sidebar) or set it in Secrets.")
+        st.error("Please enter your OpenAI API key.")
         st.stop()
-    if not uploads:
+    if not ss.files:
         st.warning("Please upload at least one file.")
         st.stop()
 
     client = build_client(api_key)
-
-    # 1) Per-paper analysis
-    st.subheader("Step 1 — Analyzing papers")
     per_paper: List[Dict[str, Any]] = []
     progress = st.progress(0.0)
     status = st.empty()
 
-    for i, up in enumerate(uploads, 1):
-        status.info(f"Reading: {up.name}")
+    for i, f in enumerate(ss.files, 1):
+        status.info(f"Reading: {f['name']} (OCR: {ocr_mode})")
         try:
-            full_text, pages = extract_text_with_pages(up, ocr_mode)
+            full_text, _pages = extract_text_with_pages_from_bytes(f["name"], f["bytes"], ocr_mode)
         except Exception as e:
-            st.warning(f"Skipping {up.name}: read error — {e}")
-            progress.progress(i / len(uploads))
+            st.warning(f"Skipping {f['name']}: read error — {e}")
+            progress.progress(i / len(ss.files))
             continue
 
         if len(full_text.strip()) < 500:
-            st.warning(f"Skipping {up.name}: very little text (consider different OCR language).")
-            progress.progress(i / len(uploads))
+            st.warning(f"Skipping {f['name']}: very little text (consider OCR Force or different language).")
+            progress.progress(i / len(ss.files))
             continue
 
-        status.info(f"LLM analysis: {up.name}")
+        status.info(f"LLM analysis: {f['name']} ({'rigorous' if rigor else 'simple'})")
         try:
             if rigor:
                 sections = split_into_sections(full_text)
-                analysis = analyze_paper_rigorous(client, model, up.name, sections)
+                analysis = analyze_paper_rigorous(client, model, f["name"], sections)
             else:
-                analysis = analyze_paper_simple(client, model, up.name, full_text[:limit_chars])
+                analysis = analyze_paper_simple(client, model, f["name"], full_text[:limit_chars])
         except Exception as e:
-            st.warning(f"LLM analysis failed for {up.name}: {e}")
-            progress.progress(i / len(uploads))
+            st.warning(f"LLM analysis failed for {f['name']}: {e}")
+            progress.progress(i / len(ss.files))
             continue
 
         per_paper.append(analysis)
-        progress.progress(i / len(uploads))
+        progress.progress(i / len(ss.files))
 
     status.empty()
     if not per_paper:
         st.error("No papers analyzed successfully.")
         st.stop()
-    st.success(f"Analyzed {len(per_paper)} papers.")
 
-    # 2) Build candidate gaps
+    ss.per_paper = per_paper
+    ss.stage = "review"
+    _safe_rerun()
+
+
+# ------------------------------------------------------------
+# Step 2 — Review candidate gaps (accept / edit)
+# ------------------------------------------------------------
+if ss.stage in ("review", "cluster", "report"):
     st.subheader("Step 2 — Review candidate gaps (accept / edit)")
+
+    # Gather raw items
     raw_items: List[Dict[str, Any]] = []
-    for a in per_paper:
+    for a in ss.per_paper:
         pid = a.get("paper_id") or "unknown"
 
-        # reported limitations
+        # Reported limitations
         for item in a.get("reported_limitations", []) or []:
             if isinstance(item, dict):
                 txt = (item.get("description") or "").strip()
                 if not txt:
                     continue
                 raw_items.append({
-                    "paper_id": pid,
-                    "text": txt,
-                    "source": "Reported",
-                    "severity": 3,
-                    "section": item.get("section", ""),
-                    "evidence_quote": item.get("evidence_quote", ""),
-                    "evidence_page": item.get("evidence_page", None),
-                    "tags": []
+                    "paper_id": pid, "text": txt, "source": "Reported", "severity": 3,
+                    "section": item.get("section", ""), "evidence_quote": item.get("evidence_quote", ""),
+                    "evidence_page": item.get("evidence_page", None), "tags": []
                 })
             elif isinstance(item, (str, int, float)):
                 t = str(item).strip()
                 if t:
                     raw_items.append({
-                        "paper_id": pid,
-                        "text": t,
-                        "source": "Reported",
-                        "severity": 3,
-                        "section": "",
-                        "evidence_quote": "",
-                        "evidence_page": None,
-                        "tags": []
+                        "paper_id": pid, "text": t, "source": "Reported", "severity": 3,
+                        "section": "", "evidence_quote": "", "evidence_page": None, "tags": []
                     })
 
-        # inferred gaps
+        # Inferred gaps
         for g in a.get("inferred_gaps", []) or []:
             if isinstance(g, dict):
                 desc = (g.get("description") or "").strip()
@@ -919,38 +1034,42 @@ if run_btn:
                     continue
                 sev = parse_severity(g.get("severity", 3))
                 raw_items.append({
-                    "paper_id": pid,
-                    "text": desc,
-                    "source": "Inferred",
-                    "severity": min(max(sev, 1), 5),
-                    "section": "",
-                    "evidence_quote": g.get("evidence_quote", ""),
-                    "evidence_page": g.get("evidence_page", None),
+                    "paper_id": pid, "text": desc, "source": "Inferred",
+                    "severity": min(max(sev, 1), 5), "section": "",
+                    "evidence_quote": g.get("evidence_quote", ""), "evidence_page": g.get("evidence_page", None),
                     "tags": []
                 })
             elif isinstance(g, (str, int, float)):
                 t = str(g).strip()
                 if t:
                     raw_items.append({
-                        "paper_id": pid,
-                        "text": t,
-                        "source": "Inferred",
-                        "severity": 3,
-                        "section": "",
-                        "evidence_quote": "",
-                        "evidence_page": None,
-                        "tags": []
+                        "paper_id": pid, "text": t, "source": "Inferred", "severity": 3,
+                        "section": "", "evidence_quote": "", "evidence_page": None, "tags": []
                     })
 
     if not raw_items:
         st.warning("No gap statements found.")
         st.stop()
 
+    # Optional tagging
+    if tagging_on:
+        try:
+            client = build_client(api_key) if api_key else None
+            if client:
+                with st.spinner("Tagging gaps…"):
+                    gap_texts = [x["text"] for x in raw_items]
+                    tag_lists = llm_tag_gaps(client, model, gap_texts)
+                    for x, tags in zip(raw_items, tag_lists):
+                        x["tags"] = [t for t in tags if t in CHECKLIST][:4]
+        except Exception:
+            pass
+
+    # ALL accepted by default so user can always advance
     df = pd.DataFrame([{
-        "Accept": True if (item["source"] == "Reported" or item["evidence_quote"]) else False,
+        "Accept": True,
         "Text": item["text"],
         "Source": item["source"],
-        "Severity": item["severity"],
+        "Severity": int(item.get("severity", 3)),
         "Section": item.get("section", ""),
         "EvidenceQuote": item.get("evidence_quote", ""),
         "EvidencePage": item.get("evidence_page", ""),
@@ -964,10 +1083,12 @@ if run_btn:
         column_config={
             "Accept": st.column_config.CheckboxColumn(),
             "Text": st.column_config.TextColumn(width="large"),
-            "Severity": st.column_config.NumberColumn(min_value=1, max_value=5, step=1)
-        }
+            "Severity": st.column_config.NumberColumn(min_value=1, max_value=5, step=1),
+        },
+        key="editor_grid"
     )
 
+    # CSV export (edited snapshot before clustering)
     st.download_button(
         "⬇️ Download CSV of current (edited) gaps",
         data=edited.to_csv(index=False).encode("utf-8"),
@@ -976,48 +1097,73 @@ if run_btn:
         width="stretch"
     )
 
-    proceed = st.button("Cluster accepted gaps", type="primary", width="stretch")
-    if not proceed:
+    col_c1, col_c2 = st.columns([1, 1])
+    proceed = col_c1.button("Cluster accepted gaps", type="primary", width="stretch")
+    fast_two_paras = col_c2.button("➡️ Skip review and generate Two-Paragraph report", type="secondary", width="stretch")
+
+    def _collect_accepted_from_editor() -> List[Dict[str, Any]]:
+        accepted_list = []
+        for row, base in zip(edited.to_dict("records"), raw_items):
+            if not row.get("Accept", False):
+                continue
+            item = base.copy()
+            item["text"] = (row.get("Text") or "").strip()
+            item["severity"] = int(row.get("Severity") or 3)
+            item["section"] = row.get("Section", "")
+            item["evidence_quote"] = row.get("EvidenceQuote", "")
+            item["evidence_page"] = row.get("EvidencePage", "")
+            item["tags"] = [t.strip() for t in (row.get("Tags", "") or "").split(",") if t.strip()]
+            accepted_list.append(item)
+        return accepted_list
+
+    go_now = proceed or fast_two_paras
+    if not go_now:
         st.stop()
 
-    accepted: List[Dict[str, Any]] = []
-    for row, base in zip(edited.to_dict("records"), raw_items):
-        if not row["Accept"]:
-            continue
-        item = base.copy()
-        item["text"] = row["Text"].strip()
-        item["severity"] = int(row["Severity"])  # editor guarantees 1..5
-        item["section"] = row.get("Section", "")
-        item["evidence_quote"] = row.get("EvidenceQuote", "")
-        item["evidence_page"] = row.get("EvidencePage", "")
-        item["tags"] = [t.strip() for t in (row.get("Tags", "") or "").split(",") if t.strip()]
-        accepted.append(item)
-
+    accepted = _collect_accepted_from_editor()
     if not accepted:
-        st.error("No gaps selected.")
+        st.info("No rows selected; using all items for clustering.")
+        accepted = []
+        for base in raw_items:
+            item = base.copy()
+            item["severity"] = int(item.get("severity", 3))
+            accepted.append(item)
+
+    ss.accepted = accepted
+    ss.stage = "cluster"
+
+
+# ------------------------------------------------------------
+# Step 3 — Clustering shared gaps
+# ------------------------------------------------------------
+if ss.stage in ("cluster", "report"):
+    st.subheader("Step 3 — Clustering shared gaps")
+
+    if not ss.accepted:
+        st.warning("No accepted gaps. Go back to review.")
         st.stop()
 
-    # 3) Clustering
-    st.subheader("Step 3 — Clustering shared gaps")
-    client = build_client(api_key)
-    texts = [g["text"] for g in accepted]
+    client = build_client(api_key) if api_key else None
+    texts = [g["text"] for g in ss.accepted]
+
+    st.info(f"Embedding {len(texts)} items with {embedding_model} …")
     vecs = embed(client, embedding_model, texts)
 
-    clusters_members = hdbscan_cluster(vecs) if rigor else greedy_cluster(vecs, threshold=sim_threshold)
+    st.info("Clustering …")
+    clusters_members = hdbscan_cluster(vecs) if (rigor and HDBSCAN_AVAILABLE and sk_normalize is not None) else greedy_cluster(vecs, threshold=sim_threshold)
 
     stats: List[Dict[str, Any]] = []
     for mem in clusters_members:
-        stats.append(cluster_stats_from_members(mem, accepted))
+        stats.append(cluster_stats_from_members(mem, ss.accepted))
 
-    order = rank_clusters(stats, total_papers=len(per_paper), rigorous=rigor)
+    order = rank_clusters(stats, total_papers=len(ss.per_paper), rigorous=rigor)
     top_idx = order[0] if order else 0
 
-    # Build payload for LLM report and appendix mapping
-    clusters_payload: Dict[str, Any] = {"total_papers": len(per_paper), "clusters": []}
+    payload: Dict[str, Any] = {"total_papers": len(ss.per_paper), "clusters": []}
     appendix_items: List[Dict[str, Any]] = []
     for ci in order:
         c = stats[ci]
-        clusters_payload["clusters"].append({
+        payload["clusters"].append({
             "index": ci,
             "label": f"Cluster {ci}",
             "paper_coverage": c["paper_coverage"],
@@ -1031,7 +1177,7 @@ if run_btn:
             "is_recommended": (ci == top_idx)
         })
         for idx in c["members_idx"]:
-            it = accepted[idx]
+            it = ss.accepted[idx]
             if it.get("evidence_quote"):
                 appendix_items.append({
                     "paper_id": it.get("paper_id", "unknown"),
@@ -1045,8 +1191,19 @@ if run_btn:
     with st.expander("Preview: top cluster examples"):
         st.write(stats[order[0]]["samples"] if order else [])
 
-    # 4) Report generation — NEW two-paragraph style
+    ss.stats = stats
+    ss.order = order
+    ss.payload = payload
+    ss.appendix = appendix_items
+    ss.stage = "report"
+
+
+# ------------------------------------------------------------
+# Step 4 — Generate report (Two-paragraph default)
+# ------------------------------------------------------------
+if ss.stage == "report":
     st.subheader("Step 4 — Generate report")
+
     style = st.radio(
         "Choose your main report style",
         ["Two-paragraph (recommended)", "Narrative", "Executive Brief (short)", "Plain-Language (very simple words)"],
@@ -1054,98 +1211,61 @@ if run_btn:
         horizontal=True
     )
 
-    try:
-        if style == "Two-paragraph (recommended)":
-            p1, p2 = llm_two_paragraph_report(client, model, clusters_payload)
-            main_text = f"{p1}\n\n{p2}"
-            main_title = "Two-Paragraph Summary — Gaps and Next Steps"
-            main_fname = "two_paragraph_summary.docx"
-        elif style == "Executive Brief (short)":
-            # keep existing styles for flexibility
-            def llm_executive_brief(client, model, clusters_payload):
-                system = "You write ultra-concise executive briefs for researchers."
-                user = (
-                    "In <= 220 words total, write:\n"
-                    "• Two short paragraphs that plainly describe the main gaps (no lists, no numbers).\n"
-                    "• One final 2–3 sentence recommendation naming the best gap to pursue and a concrete starting step.\n"
-                    "No headings, no bullets—just three compact paragraphs.\n\n"
-                    "JSON:\n" + json.dumps(clusters_payload, ensure_ascii=False)
-                )
-                content = safe_chat(
-                    client, model,
-                    [{"role": "system", "content": system}, {"role": "user", "content": user}],
-                    use_schema=False
-                )
-                return re.sub(r"`{3,}.*?`{3,}", "", content, flags=re.DOTALL).strip()
-            main_text = llm_executive_brief(client, model, clusters_payload)
-            main_title = "Executive Brief — Research Gaps"
-            main_fname = "executive_brief.docx"
-        elif style == "Plain-Language (very simple words)":
-            def llm_plain_language(client, model, clusters_payload):
-                system = (
-                    "You explain research in very simple words for busy readers."
-                    " Short sentences. No jargon. No lists. No headings."
-                )
-                user = (
-                    "Write 3–4 short paragraphs in very simple words that explain the main gaps shared across these papers. "
-                    "Then add ONE final paragraph that clearly says which single gap is best to work on next and one simple way to start. "
-                    "No lists, bullets, headings, or numbers. <= 400 words total.\n\n"
-                    "JSON:\n" + json.dumps(clusters_payload, ensure_ascii=False)
-                )
-                content = safe_chat(
-                    client, model,
-                    [{"role": "system", "content": system}, {"role": "user", "content": user}],
-                    use_schema=False
-                )
-                return re.sub(r"`{3,}.*?`{3,}", "", content, flags=re.DOTALL).strip()
-            main_text = llm_plain_language(client, model, clusters_payload)
-            main_title = "Plain-Language Summary — What’s Missing and What To Do"
-            main_fname = "plain_language_summary.docx"
-        else:
-            def llm_narrative(client, model, clusters_payload):
-                system = "You write clear, non-technical academic summaries. Return plain text only."
-                user = (
-                    "Write 3–5 short paragraphs narrating the main shared gaps (one per paragraph), "
-                    "then ONE final paragraph recommending the single gap with the best potential, with a brief rationale and a one-sentence next step.\n"
-                    "Rules: NO lists, NO bullets, NO headings, NO tables, NO explicit numbers/percentages—just prose. <= 600 words.\n\n"
-                    "JSON:\n" + json.dumps(clusters_payload, ensure_ascii=False)
-                )
-                content = safe_chat(
-                    client, model,
-                    [{"role": "system", "content": system}, {"role": "user", "content": user}],
-                    use_schema=False
-                )
-                return re.sub(r"`{3,}.*?`{3,}", "", content, flags=re.DOTALL).strip()
-            main_text = llm_narrative(client, model, clusters_payload)
-            main_title = "Research Gaps — Narrative Summary"
-            main_fname = "final_report_narrative.docx"
-    except Exception as e:
-        st.error(f"Report generation failed: {e}")
-        st.stop()
+    client = build_client(api_key) if api_key else None
 
-    # FINAL CLEAN to avoid {"text":...} or stray quotes
-    paragraphs = clean_to_two_paragraphs(main_text) if style == "Two-paragraph (recommended)" else [
-        p.strip() for p in re.split(r"\n\s*\n", re.sub(r"^```+.*?```+$", "", main_text.strip(), flags=re.DOTALL)) if p.strip()
-    ]
+    if style == "Two-paragraph (recommended)":
+        p1, p2 = llm_two_paragraph_report(client, model, ss.payload)
+        main_text = f"{p1}\n\n{p2}"
+        main_title = "Two-Paragraph Summary — Gaps and Next Steps"
+        main_fname = "two_paragraph_summary.docx"
+        paragraphs = [p1, p2]
+    elif style == "Executive Brief (short)":
+        main_text = llm_executive_brief(client, model, ss.payload)
+        main_title = "Executive Brief — Research Gaps"
+        main_fname = "executive_brief.docx"
+        paragraphs = [p.strip() for p in re.split(r"\n\s*\n", main_text) if p.strip()]
+    elif style == "Plain-Language (very simple words)":
+        main_text = llm_plain_language(client, model, ss.payload)
+        main_title = "Plain-Language Summary — What’s Missing and What To Do"
+        main_fname = "plain_language_summary.docx"
+        paragraphs = [p.strip() for p in re.split(r"\n\s*\n", main_text) if p.strip()]
+    else:
+        main_text = llm_narrative(client, model, ss.payload)
+        main_title = "Research Gaps — Narrative Summary"
+        main_fname = "final_report_narrative.docx"
+        paragraphs = [p.strip() for p in re.split(r"\n\s*\n", main_text) if p.strip()]
 
+    # Preview
     st.text_area("Report preview", value="\n\n".join(paragraphs), height=260, width="stretch")
 
-    # Build DOCX (plus appendix)
-    docx_main = docx_from_paragraphs_with_appendix(
-        main_title, paragraphs, appendix_items, logo_bytes, accent
+    # Build binaries (DOCX preferred, else RTF), TXT always
+    if Document is not None:
+        data_main = docx_from_paragraphs_with_appendix(main_title, paragraphs, ss.appendix, logo_bytes, accent)
+        main_ext = ".docx"
+        main_mime = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+    else:
+        data_main = rtf_from_paragraphs(main_title, paragraphs)
+        main_ext = ".rtf"
+        main_mime = "application/rtf"
+
+    data_txt = txt_from_paragraphs(main_title, paragraphs)
+
+    st.download_button(
+        f"⬇️ Download {main_fname if main_ext=='.docx' else 'report.rtf'}",
+        data=data_main,
+        file_name=(main_fname if main_ext == ".docx" else "report.rtf"),
+        mime=main_mime,
+        width="stretch"
+    )
+    st.download_button(
+        "⬇️ Download TXT (always available)",
+        data=data_txt,
+        file_name="report.txt",
+        mime="text/plain",
+        width="stretch"
     )
 
-    # Download buttons
-    if docx_main:
-        st.download_button(
-            f"⬇️ Download {main_fname}",
-            data=docx_main,
-            file_name=main_fname,
-            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-            width="stretch"
-        )
-
-    # CSV of accepted gaps (final snapshot after clustering stage)
+    # CSV of accepted gaps (final snapshot)
     final_df = pd.DataFrame([{
         "PaperID": it["paper_id"],
         "Text": it["text"],
@@ -1155,7 +1275,7 @@ if run_btn:
         "EvidenceQuote": it.get("evidence_quote", ""),
         "EvidencePage": it.get("evidence_page", ""),
         "Tags": ", ".join(it.get("tags", []))
-    } for it in accepted])
+    } for it in ss.accepted])
 
     st.download_button(
         "⬇️ Download CSV of accepted gaps (final)",
