@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
-# Streamlit Paper Gap Analyzer — clean 2-paragraph DOCX + OCR + clustering + CSV + appendix
-# -----------------------------------------------------------------------------------------
-# Upload up to 50 PDFs/DOCX/TXT. Analyze shared research gaps, cluster similar gaps,
-# and export a clean, branded **two-paragraph** Word report (plus other styles).
+# Streamlit Paper Gap Analyzer — polished 2-paragraph DOCX + OCR + clustering + CSV
+# ---------------------------------------------------------------------------------
+# Two clearly separated sections in the report:
+#  • "Shared Gaps — Narrative"  (paragraph 1)
+#  • "Recommendation — Focus & How to Build Novelty" (paragraph 2 in a callout box)
+#
+# No detailed lists in the report (details live in the CSV). Appendix is OFF by default.
 
 from __future__ import annotations
 
@@ -34,12 +37,15 @@ try:
 except Exception:
     OCR_AVAILABLE = False
 
+# DOCX (for the polished report)
 try:
     from docx import Document
-    from docx.shared import Inches, Pt
+    from docx.shared import Inches, Pt, RGBColor
     from docx.enum.text import WD_ALIGN_PARAGRAPH
+    from docx.oxml import OxmlElement
+    from docx.oxml.ns import qn
 except Exception:
-    Document = None
+    Document = None  # we'll fall back to RTF/TXT if python-docx is missing
 
 try:
     from sklearn.preprocessing import normalize as sk_normalize
@@ -138,7 +144,7 @@ def get_logo_bytes() -> Optional[bytes]:
         return None
 
 def inject_brand_css(accent_hex: str):
-    # Plain string (not f-string) to avoid curly-brace issues
+    # Plain string, avoid f-string so braces can't break parsing
     css = (
         "<style>\n"
         ".app-title {\n"
@@ -159,10 +165,11 @@ logo_bytes = get_logo_bytes()
 left, right = st.columns([1, 5])
 with left:
     if logo_bytes:
-        st.image(logo_bytes, width="stretch")
+        # Use fixed width to avoid deprecated use_container_width warning
+        st.image(logo_bytes, width=140)
 with right:
     st.markdown('<div class="app-title"><h1 style="margin:0;">🧠 Paper Gap Analyzer</h1></div>', unsafe_allow_html=True)
-    st.caption("Find shared research gaps across uploaded papers and export a clean, branded two-paragraph Word report.")
+    st.caption("Find shared research gaps and export a clean, branded two-paragraph Word report (no detailed lists).")
 
 # ------------------------------------------------------------
 # Parsers & LLM helpers
@@ -706,80 +713,153 @@ def llm_two_paragraph_report(client: OpenAI, model: str, clusters_payload: Dict[
         use_schema=False)
     return clean_to_two_paragraphs(content)
 
-# Other styles
-def llm_narrative(client: OpenAI, model: str, clusters_payload: Dict[str, Any]) -> str:
-    system = "You write clear, non-technical academic summaries. Return plain text only."
-    user = ("Write 3–5 short paragraphs narrating the main shared gaps, "
-            "then ONE final paragraph recommending the single gap with the best potential, with a brief rationale and a one-sentence next step.\n"
-            "Rules: NO lists, NO bullets, NO headings, NO explicit numbers/percentages—just prose. <= 600 words.\n\n"
-            "JSON:\n" + json.dumps(clusters_payload, ensure_ascii=False))
-    content = safe_chat(client, model,
-                        [{"role": "system", "content": system}, {"role": "user", "content": user}],
-                        use_schema=False)
-    return re.sub(r"`{3,}.*?`{3,}", "", content, flags=re.DOTALL).strip()
+# ------------------------------------------------------------
+# DOCX builders (polished)
+# ------------------------------------------------------------
+def _hex_to_rgb(accent_hex: str) -> Tuple[int, int, int]:
+    h = (accent_hex or "#3B82F6").lstrip("#")
+    if len(h) == 3:
+        h = "".join([c*2 for c in h])
+    try:
+        r = int(h[0:2], 16); g = int(h[2:4], 16); b = int(h[4:6], 16)
+        return r, g, b
+    except Exception:
+        return (59, 130, 246)  # blue-500 fallback
 
-def llm_executive_brief(client: OpenAI, model: str, clusters_payload: Dict[str, Any]) -> str:
-    system = "You write ultra-concise executive briefs for researchers."
-    user = ("In <= 220 words total, write two short paragraphs that plainly describe the main gaps, "
-            "then one final 2–3 sentence recommendation naming the best gap and a concrete starting step.\n"
-            "No headings, no bullets.\n\n"
-            "JSON:\n" + json.dumps(clusters_payload, ensure_ascii=False))
-    content = safe_chat(client, model,
-                        [{"role": "system", "content": system}, {"role": "user", "content": user}],
-                        use_schema=False)
-    return re.sub(r"`{3,}.*?`{3,}", "", content, flags=re.DOTALL).strip()
+def _lighten_hex(accent_hex: str, factor: float = 0.85) -> str:
+    r, g, b = _hex_to_rgb(accent_hex)
+    r = int(r + (255 - r) * factor)
+    g = int(g + (255 - g) * factor)
+    b = int(b + (255 - b) * factor)
+    return f"{r:02X}{g:02X}{b:02X}"
 
-def llm_plain_language(client: OpenAI, model: str, clusters_payload: Dict[str, Any]) -> str:
-    system = "You explain research in very simple words. Short sentences. No jargon. Plain text only."
-    user = ("Write 3–4 short paragraphs in very simple words explaining the main shared gaps. "
-            "Then one final paragraph naming the best gap to work on next and a simple way to start. "
-            "No lists, bullets, headings, or numbers. <= 400 words.\n\n"
-            "JSON:\n" + json.dumps(clusters_payload, ensure_ascii=False))
-    content = safe_chat(client, model,
-                        [{"role": "system", "content": system}, {"role": "user", "content": user}],
-                        use_schema=False)
-    return re.sub(r"`{3,}.*?`{3,}", "", content, flags=re.DOTALL).strip()
+def _shade_cell(cell, hex_fill_no_hash: str):
+    """Apply background shading to a table cell."""
+    tc_pr = cell._tc.get_or_add_tcPr()
+    shd = OxmlElement('w:shd')
+    shd.set(qn('w:val'), 'clear')
+    shd.set(qn('w:color'), 'auto')
+    shd.set(qn('w:fill'), hex_fill_no_hash.upper())
+    tc_pr.append(shd)
 
-# Writers
-def docx_from_paragraphs_with_appendix(title, paragraphs, appendix_items, logo_bytes, accent_hex) -> bytes:
+def docx_two_section_report(
+    title: str,
+    p1: str,
+    p2: str,
+    logo_bytes: Optional[bytes],
+    accent_hex: str,
+    include_appendix: bool,
+    appendix_items: List[Dict[str, Any]]
+) -> bytes:
+    """
+    Polished DOCX:
+      • Logo + Title + Generated date
+      • H1: Shared Gaps — Narrative  (p1)
+      • H1: Recommendation — Focus & How to Build Novelty (p2) inside a shaded callout box
+      • Appendix optional (OFF by default)
+    """
     if Document is None:
         return b""
     doc = Document()
+
+    # Page margins
     for sec in doc.sections:
-        sec.top_margin = Inches(0.8); sec.bottom_margin = Inches(0.8)
-        sec.left_margin = Inches(0.8); sec.right_margin = Inches(0.8)
+        sec.top_margin = Inches(0.8)
+        sec.bottom_margin = Inches(0.8)
+        sec.left_margin = Inches(0.8)
+        sec.right_margin = Inches(0.8)
+
+    # Logo
     if logo_bytes:
         try:
             doc.add_picture(io.BytesIO(logo_bytes), width=Inches(1.4))
         except Exception:
             pass
-    h = doc.add_paragraph(title); h.style = "Title"; h.alignment = WD_ALIGN_PARAGRAPH.LEFT
-    sub = doc.add_paragraph(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}"); sub.alignment = WD_ALIGN_PARAGRAPH.LEFT
+
+    # Title + date
+    h = doc.add_paragraph(title)
+    h.style = "Title"
+    h.alignment = WD_ALIGN_PARAGRAPH.LEFT
+    sub = doc.add_paragraph(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+    sub.alignment = WD_ALIGN_PARAGRAPH.LEFT
     doc.add_paragraph()
-    for ptxt in [p.strip() for p in paragraphs if p.strip()]:
-        p = doc.add_paragraph(ptxt)
-        pf = p.paragraph_format; pf.space_after = Pt(8); pf.line_spacing = 1.25
-        p.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
-    if appendix_items:
+
+    # Colors
+    r, g, b = _hex_to_rgb(accent_hex)
+    light_fill = _lighten_hex(accent_hex, 0.88)
+
+    # Section 1 — Shared Gaps
+    hdr1 = doc.add_paragraph()
+    run1 = hdr1.add_run("Shared Gaps — Narrative")
+    run1.bold = True
+    run1.font.size = Pt(14)
+    run1.font.color.rgb = RGBColor(r, g, b)
+    p = doc.add_paragraph(p1.strip())
+    pf = p.paragraph_format
+    pf.space_after = Pt(8)
+    pf.line_spacing = 1.25
+    p.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
+
+    doc.add_paragraph()  # spacer
+
+    # Section 2 — Recommendation callout
+    hdr2 = doc.add_paragraph()
+    run2 = hdr2.add_run("Recommendation — Focus & How to Build Novelty")
+    run2.bold = True
+    run2.font.size = Pt(14)
+    run2.font.color.rgb = RGBColor(r, g, b)
+
+    table = doc.add_table(rows=1, cols=1)
+    cell = table.cell(0, 0)
+    _shade_cell(cell, light_fill)  # soft background
+    par = cell.paragraphs[0]
+    run = par.add_run(p2.strip())
+    run.font.size = Pt(11)
+    par.paragraph_format.space_after = Pt(6)
+    par.paragraph_format.line_spacing = 1.25
+
+    # Appendix (optional; OFF by default)
+    if include_appendix and appendix_items:
         doc.add_paragraph()
         app_h = doc.add_paragraph("Appendix — Representative Quotes")
-        if app_h.runs: app_h.runs[0].bold = True
-        for it in appendix_items[:40]:
+        app_run = app_h.add_run()
+        app_run.bold = True
+        for it in appendix_items[:30]:
             line = f"{it.get('paper_id', 'unknown')} — "
-            if it.get("evidence_page"): line += f"[p. {it.get('evidence_page')}] "
+            if it.get("evidence_page"):
+                line += f"[p. {it.get('evidence_page')}] "
             line += f"“{(it.get('evidence_quote') or '').strip()}”"
             para = doc.add_paragraph(line)
-            para.paragraph_format.space_after = Pt(4); para.paragraph_format.line_spacing = 1.15
-    bio = io.BytesIO(); doc.save(bio); return bio.getvalue()
+            para.paragraph_format.space_after = Pt(3)
+            para.paragraph_format.line_spacing = 1.15
 
-def rtf_from_paragraphs(title: str, paras: List[str]) -> bytes:
+    bio = io.BytesIO()
+    doc.save(bio)
+    return bio.getvalue()
+
+def rtf_two_section_report(title: str, p1: str, p2: str) -> bytes:
     def esc(s: str) -> str:
         return s.replace("\\", r"\\").replace("{", r"\{").replace("}", r"\}")
-    body = "".join([esc(p) + r"\par " for p in paras])
-    return (r"{\rtf1\ansi\deff0\fs28 \b " + esc(title) + r"\b0\par " + body + "}").encode("utf-8")
+    body = (
+        r"\b " + esc("Shared Gaps — Narrative") + r"\b0\par " + esc(p1.strip()) + r"\par\par " +
+        r"\b " + esc("Recommendation — Focus & How to Build Novelty") + r"\b0\par " + esc(p2.strip()) + r"\par"
+    )
+    return (r"{\rtf1\ansi\deff0\fs28 \b " + esc(title) + r"\b0\par " +
+            esc("Generated: " + datetime.now().strftime('%Y-%m-%d %H:%M')) + r"\par\par " +
+            body + "}").encode("utf-8")
 
-def txt_from_paragraphs(title: str, paras: List[str]) -> bytes:
-    return ("\n\n".join([title, ""] + paras)).encode("utf-8")
+def txt_two_section_report(title: str, p1: str, p2: str) -> bytes:
+    out = [
+        title,
+        f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}",
+        "",
+        "Shared Gaps — Narrative",
+        p1.strip(),
+        "",
+        "Recommendation — Focus & How to Build Novelty",
+        p2.strip()
+    ]
+    return ("\n".join(out)).encode("utf-8")
 
 # ------------------------------------------------------------
 # Upload + Controls
@@ -864,6 +944,7 @@ if ss.stage == "review":
     raw_items: List[Dict[str, Any]] = []
     for a in ss.per_paper:
         pid = a.get("paper_id") or "unknown"
+        # Reported limitations
         for item in a.get("reported_limitations", []) or []:
             if isinstance(item, dict):
                 txt = (item.get("description") or "").strip()
@@ -876,6 +957,7 @@ if ss.stage == "review":
                 if t:
                     raw_items.append({"paper_id": pid, "text": t, "source": "Reported", "severity": 3,
                                       "section": "", "evidence_quote": "", "evidence_page": None, "tags": []})
+        # Inferred gaps
         for g in a.get("inferred_gaps", []) or []:
             if isinstance(g, dict):
                 desc = (g.get("description") or "").strip()
@@ -940,7 +1022,7 @@ if ss.stage == "review":
 
     col_c1, col_c2 = st.columns([1, 1])
     proceed = col_c1.button("Cluster accepted gaps", type="primary", width="stretch")
-    fast_two_paras = col_c2.button("➡️ Skip review and generate Two-Paragraph report", type="secondary", width="stretch")
+    fast_two_paras = col_c2.button("➡️ Skip review and generate report", type="secondary", width="stretch")
 
     def _collect_accepted_from_editor() -> List[Dict[str, Any]]:
         accepted_list = []
@@ -1031,67 +1113,50 @@ if ss.stage == "cluster":
     _safe_rerun()
 
 # ------------------------------------------------------------
-# Step 4 — Report
+# Step 4 — Report (polished two-section DOCX)
 # ------------------------------------------------------------
 if ss.stage == "report":
     st.subheader("Step 4 — Generate report")
 
-    style = st.radio(
-        "Choose your main report style",
-        ["Two-paragraph (recommended)", "Narrative", "Executive Brief (short)", "Plain-Language (very simple words)"],
-        index=0,
-        horizontal=True
-    )
+    include_appendix = st.checkbox("Include appendix of representative quotes (optional)", value=False)
 
     client = build_client(api_key)
 
+    # Always use the polished 2-section template for clarity
     try:
-        if style == "Two-paragraph (recommended)":
-            p1, p2 = llm_two_paragraph_report(client, model, ss.payload)
-            main_text = f"{p1}\n\n{p2}"
-            main_title = "Two-Paragraph Summary — Gaps and Next Steps"
-            main_fname = "two_paragraph_summary.docx"
-            paragraphs = [p1, p2]
-        elif style == "Executive Brief (short)":
-            main_text = llm_executive_brief(client, model, ss.payload)
-            main_title = "Executive Brief — Research Gaps"
-            main_fname = "executive_brief.docx"
-            paragraphs = [p.strip() for p in re.split(r"\n\s*\n", main_text) if p.strip()]
-        elif style == "Plain-Language (very simple words)":
-            main_text = llm_plain_language(client, model, ss.payload)
-            main_title = "Plain-Language Summary — What’s Missing and What To Do"
-            main_fname = "plain_language_summary.docx"
-            paragraphs = [p.strip() for p in re.split(r"\n\s*\n", main_text) if p.strip()]
-        else:
-            main_text = llm_narrative(client, model, ss.payload)
-            main_title = "Research Gaps — Narrative Summary"
-            main_fname = "final_report_narrative.docx"
-            paragraphs = [p.strip() for p in re.split(r"\n\s*\n", main_text) if p.strip()]
+        p1, p2 = llm_two_paragraph_report(client, model, ss.payload)
     except Exception as e:
         st.error(f"Report generation failed: {e}")
         st.stop()
 
-    st.text_area("Report preview", value="\n\n".join(paragraphs), height=260, width="stretch")
+    st.text_area("Preview (two paragraphs)", value=f"{p1}\n\n{p2}", height=240, width="stretch")
 
+    title = "Research Gaps — Two-Paragraph Summary"
     if Document is not None:
-        data_main = docx_from_paragraphs_with_appendix(main_title, paragraphs, ss.appendix, logo_bytes, accent)
-        main_ext = ".docx"; main_mime = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+        docx_data = docx_two_section_report(title, p1, p2, logo_bytes, accent, include_appendix, ss.appendix)
+        main_fname = "two_paragraph_summary.docx"
+        main_mime = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+        st.download_button(
+            f"⬇️ Download {main_fname}",
+            data=docx_data,
+            file_name=main_fname,
+            mime=main_mime,
+            width="stretch"
+        )
     else:
-        data_main = rtf_from_paragraphs(main_title, paragraphs)
-        main_ext = ".rtf"; main_mime = "application/rtf"
+        rtf_data = rtf_two_section_report(title, p1, p2)
+        st.download_button(
+            "⬇️ Download report.rtf",
+            data=rtf_data,
+            file_name="report.rtf",
+            mime="application/rtf",
+            width="stretch"
+        )
 
-    data_txt = txt_from_paragraphs(main_title, paragraphs)
-
-    st.download_button(
-        f"⬇️ Download {main_fname if main_ext=='.docx' else 'report.rtf'}",
-        data=data_main,
-        file_name=(main_fname if main_ext == ".docx" else "report.rtf"),
-        mime=main_mime,
-        width="stretch"
-    )
+    # TXT as universal fallback
     st.download_button(
         "⬇️ Download TXT (always available)",
-        data=data_txt,
+        data=txt_two_section_report(title, p1, p2),
         file_name="report.txt",
         mime="text/plain",
         width="stretch"
